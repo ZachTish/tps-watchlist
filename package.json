@@ -1,0 +1,20 @@
+{
+  "name": "tps-watchlist",
+  "version": "0.1.1",
+  "description": "Contract-native external monitoring for TPS.",
+  "main": "main.js",
+  "scripts": {
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "test:core": "node esbuild.test.mjs && node --test .test/watch-core.test.cjs",
+    "test": "npm run test:core && npm run build"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^16.11.6",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.19.3",
+    "obsidian": "latest",
+    "tslib": "2.4.0",
+    "typescript": "4.7.4"
+  }
+}

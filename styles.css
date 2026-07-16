@@ -1,0 +1,245 @@
+.tps-watchlist-view {
+  --watch-accent: var(--color-cyan, #2b8f9d);
+  --watch-warm: var(--color-orange, #c77a32);
+  --watch-danger: var(--color-red, #c94f55);
+  padding: 22px;
+  background:
+    radial-gradient(circle at 12% 0%, color-mix(in srgb, var(--watch-accent) 12%, transparent), transparent 30%),
+    linear-gradient(180deg, color-mix(in srgb, var(--background-primary) 96%, var(--watch-accent)), var(--background-primary));
+}
+
+.tps-watchlist-header,
+.tps-watchlist-header-actions,
+.tps-watchlist-card-title-line,
+.tps-watch-card-metadata,
+.tps-watch-card-latest,
+.tps-watch-card-actions,
+.tps-watch-modal-actions {
+  display: flex;
+  align-items: center;
+}
+
+.tps-watchlist-header {
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 18px;
+}
+
+.tps-watchlist-title-group h2 {
+  margin: 0;
+  font-family: "Avenir Next", "Trebuchet MS", sans-serif;
+  letter-spacing: -0.035em;
+  font-size: 2rem;
+}
+
+.tps-watchlist-title-group p,
+.tps-watch-modal-intro {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+}
+
+.tps-watchlist-header-actions {
+  gap: 8px;
+}
+
+.tps-watch-action {
+  gap: 7px;
+  min-width: 34px;
+  min-height: 34px;
+}
+
+.tps-watchlist-tools {
+  margin-bottom: 12px;
+}
+
+.tps-watchlist-tools input {
+  width: min(100%, 480px);
+  border-radius: 999px;
+  padding: 9px 15px;
+  background: var(--background-secondary);
+}
+
+.tps-watchlist-list {
+  display: grid;
+  gap: 10px;
+}
+
+.tps-watch-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  padding: 14px 14px 14px 17px;
+  border: 1px solid var(--background-modifier-border);
+  border-left: 4px solid var(--watch-accent);
+  border-radius: 13px;
+  background: color-mix(in srgb, var(--background-secondary) 88%, transparent);
+  box-shadow: 0 7px 22px rgb(0 0 0 / 0.06);
+}
+
+.tps-watch-card:hover {
+  border-color: color-mix(in srgb, var(--watch-accent) 55%, var(--background-modifier-border));
+  transform: translateY(-1px);
+}
+
+.tps-watch-card.is-paused {
+  border-left-color: var(--text-faint);
+  opacity: 0.76;
+}
+
+.tps-watch-card.has-error {
+  border-left-color: var(--watch-danger);
+}
+
+.tps-watch-card-main {
+  min-width: 0;
+  cursor: pointer;
+}
+
+.tps-watch-card-title-line {
+  gap: 9px;
+  min-width: 0;
+}
+
+.tps-watch-card-title-line strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 1.05rem;
+}
+
+.tps-watch-pill {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.tps-watch-pill.is-active {
+  color: var(--watch-accent);
+  background: color-mix(in srgb, var(--watch-accent) 13%, transparent);
+}
+
+.tps-watch-pill.is-muted {
+  color: var(--text-muted);
+  background: var(--background-modifier-hover);
+}
+
+.tps-watch-card-metadata {
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  margin-top: 6px;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
+.tps-watch-card-latest {
+  justify-content: space-between;
+  gap: 15px;
+  margin-top: 11px;
+  min-width: 0;
+}
+
+.tps-watch-card-latest > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tps-watch-time,
+.tps-watch-muted {
+  color: var(--text-faint);
+  font-size: 0.78rem;
+  flex: 0 0 auto;
+}
+
+.tps-watch-error {
+  color: var(--watch-danger);
+}
+
+.tps-watch-card-actions {
+  gap: 3px;
+}
+
+.tps-watchlist-empty {
+  padding: 44px 24px;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: 14px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.tps-watch-modal {
+  width: min(720px, calc(100vw - 28px));
+}
+
+.tps-watch-modal .setting-item {
+  align-items: flex-start;
+}
+
+.tps-watch-modal .setting-item-control input[type="text"],
+.tps-watch-modal .setting-item-control input[type="number"] {
+  width: min(330px, 48vw);
+}
+
+.tps-watch-modal-actions {
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.tps-watch-settings-section {
+  margin: 12px 0;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+}
+
+.tps-watch-settings-section > summary {
+  padding: 12px 14px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.tps-watch-settings-body {
+  padding: 0 14px 8px;
+}
+
+@media (max-width: 640px) {
+  .tps-watchlist-view {
+    padding: 14px 10px;
+  }
+
+  .tps-watchlist-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .tps-watch-card {
+    grid-template-columns: 1fr;
+  }
+
+  .tps-watch-card-actions {
+    justify-content: flex-end;
+    border-top: 1px solid var(--background-modifier-border);
+    padding-top: 8px;
+  }
+
+  .tps-watch-card-latest {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .tps-watch-modal .setting-item {
+    display: block;
+  }
+
+  .tps-watch-modal .setting-item-control,
+  .tps-watch-modal .setting-item-control input[type="text"],
+  .tps-watch-modal .setting-item-control input[type="number"],
+  .tps-watch-modal .setting-item-control select {
+    width: 100%;
+  }
+}
