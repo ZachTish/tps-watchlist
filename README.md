@@ -6,6 +6,10 @@ Canonical source, tests, Git metadata, and dependencies live in `/Users/zachtish
 
 - 2026-07-16 isolation validation: all 15 declared tests and the required final `npm run build` passed with `[runtime-deploy] target=test ... unchanged`. Obsidian 1.12.7 loaded Watchlist in the registered test vault with no watch records or outbound requests and created only its empty QA Bases. No live promotion occurred, and production runtime checksums remained unchanged.
 
+## Install with BRAT
+
+Add the private repository `ZachTish/tps-watchlist` to BRAT and select **Latest** tracking so BRAT follows the newest GitHub release. For private-repository access, give BRAT a fine-grained GitHub token scoped to this repository with **Contents: Read-only** permission. Never commit the token to this repository, an Obsidian vault, or any synced note.
+
 TPS Watchlist is the contract-native monitoring domain for products, prices, availability, releases, feeds, market data endpoints, industry news, and other external changes.
 
 The plugin treats a watch as a durable entity note, an observation as derived state, and a meaningful transition as a typed instance line. Watches remain inspectable and editable without the plugin.
