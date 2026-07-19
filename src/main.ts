@@ -1,24 +1,45 @@
 import {
+  getFrontMatterInfo,
   Notice,
   normalizePath,
+  parseYaml,
   Platform,
   Plugin,
   TFile,
+  TFolder,
   WorkspaceLeaf,
 } from "obsidian";
 import {
   appendLineOnce,
+  applyWatchEffectJournal,
+  applyWatchDefinitionOverlays,
+  applyWatchStateCommit,
+  cloneWatchStateRecord,
   createEmptyState,
   createEventId,
+  createUntrustedOperationalState,
+  createWatchEffectJournal,
+  createWatchStateRecord,
+  duplicateWatchIdError,
   evaluateObservation,
+  findDuplicateWatchIdPaths,
   isActiveStatus,
   joinSingleFlight,
   normalizeText,
+  planWatchStateMigration,
+  quarantineWatchIdentities,
+  recordWatchCommittedEffect,
+  recordWatchIdentityWrite,
   sanitizeWatchErrorMessage,
   WATCH_FINGERPRINT_VERSION,
   stableHash,
   truncate,
   validateDefinition,
+  watchDefinitionContentSignature,
+  watchDefinitionSignature,
+  watchEventTransitionKey,
+  WatchIdentityLeaseRegistry,
+  WatchCatalogSettlementTracker,
 } from "./core";
 import { fetchWatchObservation } from "./providers";
 import { CreateWatchModal } from "./modal";
@@ -39,6 +60,7 @@ import type {
   WatchlistApi,
   WatchlistSettings,
 } from "./types";
+import type { WatchEffectJournal, WatchIdentityLease, WatchStateMigrationPlan } from "./core";
 
 const WATCH_CONDITIONS: WatchCondition[] = [
   "changed",
@@ -51,31 +73,133 @@ const WATCH_CONDITIONS: WatchCondition[] = [
   "available",
 ];
 const WATCH_PROVIDERS: WatchProvider[] = ["page", "json", "rss"];
+const WATCH_IDENTITY_STATE_VERSION = 1;
+
+interface WatchIdentitySnapshot {
+  revision: number;
+  definitions: WatchDefinition[];
+  definitionsByPath: Map<string, WatchDefinition>;
+  duplicatePathsById: Map<string, string[]>;
+  durableIds: Set<string>;
+}
+
+interface PreparedWatchIdentity {
+  definition: WatchDefinition;
+  migration: WatchStateMigrationPlan;
+  expectedMtime: number;
+  ownerKey: string;
+  trustedCatalogOverlays: Map<string, TrustedCatalogOverlay>;
+}
+
+interface TrustedCatalogOverlay {
+  revision?: number;
+  definition: WatchDefinition | null;
+}
+
+interface PersistentWatchStateModel {
+  states: Record<string, WatchState>;
+  transientStates: Record<string, WatchState>;
+  quarantinedWatchIds: Set<string>;
+  quarantinedWatchPaths: Set<string>;
+}
+
+interface PersistentStateMutation<T> {
+  changed: boolean;
+  value: T;
+}
+
+interface CatalogRecoveryResult {
+  settled: number;
+  remaining: number;
+  readFailures: number;
+}
+
+interface PendingPathStateMove {
+  oldPath: string;
+  newPath: string;
+}
+
+interface WatchEventWriteResult {
+  appended: boolean;
+  targetPath: string;
+  targetFile: TFile;
+  contentAfterWrite: string;
+}
+
+interface StableLiveWatchDefinition {
+  definition: WatchDefinition;
+  file: TFile;
+  expectedMtime: number;
+  ownerKey: string;
+  pendingRevision?: number;
+}
+
+class WatchDefinitionChangedError extends Error {}
+class WatchStatePersistenceError extends Error {}
 
 export default class TPSWatchlistPlugin extends Plugin {
   settings: WatchlistSettings = DEFAULT_SETTINGS;
-  private states: Record<string, WatchState> = {};
+  private states: Record<string, WatchState> = createWatchStateRecord();
+  private transientStates: Record<string, WatchState> = createWatchStateRecord();
+  private quarantinedWatchIds = new Set<string>();
+  private quarantinedWatchPaths = new Set<string>();
   private schedulerIntervalId: number | null = null;
   private startupTimeoutId: number | null = null;
   private batchInFlight = false;
   private checksInFlight = new Map<string, Promise<WatchCheckResult>>();
+  private identityLeases = new WatchIdentityLeaseRegistry();
+  private watchCatalogRevision = 0;
+  private identitySnapshotCache: WatchIdentitySnapshot | null = null;
+  private watchCatalogReady = false;
+  private catalogVaultEventsReady = false;
+  private catalogSettlements = new WatchCatalogSettlementTracker();
+  private knownWatchPaths = new Set<string>();
+  private catalogReadinessProbe: Promise<void> | null = null;
+  private catalogRecoveryTimerId: number | null = null;
+  private catalogRecoveryInFlight: Promise<void> | null = null;
+  private catalogRecoveryRequested = false;
+  private catalogRecoveryAttempt = 0;
+  private catalogRecoveryReadFailurePaths = new Set<string>();
+  private unloading = false;
+  private fileOwnerKeys = new WeakMap<TFile, string>();
+  private nextFileOwnerKey = 1;
   private saveSerial: Promise<void> = Promise.resolve();
+  private quarantinePersistBarrier: Promise<void> = Promise.resolve();
+  private pendingQuarantineIds = new Set<string>();
+  private pendingQuarantinePaths = new Set<string>();
+  private pendingPathStateMoves: PendingPathStateMove[] = [];
   private unregisterGcmActions: Array<() => void> = [];
   private unregisterAiCapabilities: Array<() => void> = [];
   private api!: WatchlistApi;
 
   async onload(): Promise<void> {
+    this.unloading = false;
     await this.loadPluginData();
     logger.setLogging(this.settings.enableLogging);
     this.registerView(WATCHLIST_VIEW_TYPE, (leaf) => new WatchlistView(leaf, this));
     this.registerCommands();
-    this.addRibbonIcon("binoculars", "Open TPS Watchlist", () => void this.openDashboard());
+    this.addRibbonIcon("binoculars", "Open TPS Watchlist", () => {
+      void this.runUserAction("open-dashboard", "Open Watchlist", () => this.openDashboard());
+    });
     this.addSettingTab(new WatchlistSettingTab(this.app, this));
     this.exposeApi();
 
-    this.registerEvent(this.app.metadataCache.on("changed", (file) => {
-      const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter || {};
-      if (normalizeText(frontmatter.kind).toLocaleLowerCase() === "watch") void this.refreshViews();
+    this.registerEvent(this.app.metadataCache.on("changed", (file, data, cache) => {
+      const wasWatch = this.knownWatchPaths.has(file.path)
+        || this.identitySnapshotCache?.definitionsByPath.has(file.path) === true;
+      const isWatch = normalizeText(cache.frontmatter?.kind).toLocaleLowerCase() === "watch";
+      void this.settleCatalogMetadata(file, data, wasWatch || isWatch).then((result) => {
+        if (result === "superseded") this.requestCatalogRecovery("metadata-superseded");
+      }).catch((error) => {
+        logger.failure("Identity", "metadata-settlement:failed", new Error(sanitizeWatchErrorMessage(error)), {
+          path: file.path,
+        });
+        this.requestCatalogRecovery("metadata-read-failed");
+      });
+    }));
+    this.registerEvent(this.app.metadataCache.on("resolved", () => {
+      this.catalogRecoveryAttempt = 0;
+      this.requestCatalogRecovery("metadata-resolved", true);
     }));
     this.registerEvent(this.app.workspace.on("tps:controller-role-changed" as any, (() => {
       logger.flow("Scheduler", "controller-role-changed");
@@ -83,6 +207,10 @@ export default class TPSWatchlistPlugin extends Plugin {
     }) as any));
 
     this.app.workspace.onLayoutReady(() => {
+      if (this.unloading) return;
+      this.registerCatalogVaultEvents();
+      this.catalogVaultEventsReady = true;
+      this.requestCatalogRecovery("layout-ready", true);
       void this.initializeIntegrations();
     });
     this.startScheduler();
@@ -90,10 +218,15 @@ export default class TPSWatchlistPlugin extends Plugin {
       executionMode: this.settings.executionMode,
       defaultIntervalMinutes: this.settings.defaultIntervalMinutes,
       stateCount: Object.keys(this.states).length,
+      transientStateCount: Object.keys(this.transientStates).length,
+      quarantinedIdentityCount: this.quarantinedWatchIds.size,
+      quarantinedPathCount: this.quarantinedWatchPaths.size,
     });
   }
 
   onunload(): void {
+    this.unloading = true;
+    this.stopCatalogRecovery();
     this.stopScheduler();
     for (const unregister of this.unregisterGcmActions.splice(0)) unregister();
     for (const unregister of this.unregisterAiCapabilities.splice(0)) unregister();
@@ -105,6 +238,7 @@ export default class TPSWatchlistPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     this.settings = sanitizeSettings(this.settings);
+    this.invalidateWatchCatalog();
     logger.setLogging(this.settings.enableLogging);
     await this.persistData();
     this.startScheduler();
@@ -120,6 +254,20 @@ export default class TPSWatchlistPlugin extends Plugin {
     new CreateWatchModal(this, this.settings.defaultIntervalMinutes, this.settings.defaultNotify).open();
   }
 
+  async runUserAction(
+    actionId: string,
+    label: string,
+    action: () => void | Promise<void>,
+  ): Promise<void> {
+    try {
+      await action();
+    } catch (error) {
+      const summary = truncate(sanitizeWatchErrorMessage(error), 200);
+      logger.failure("UI", "action:failed", new Error(summary), { actionId });
+      new Notice(label + " failed: " + summary);
+    }
+  }
+
   async createWatch(input: CreateWatchInput): Promise<TFile> {
     const title = normalizeText(input.title);
     const url = normalizeText(input.url);
@@ -129,12 +277,13 @@ export default class TPSWatchlistPlugin extends Plugin {
     const condition = WATCH_CONDITIONS.includes(input.condition as WatchCondition)
       ? input.condition as WatchCondition
       : provider === "rss" ? "new-item" : "changed";
-    const id = createLocalId("watch");
+    const id = this.createUniqueWatchId();
     const intervalMinutes = clampInteger(input.intervalMinutes, this.settings.defaultIntervalMinutes, 1, 10080);
     const cooldownMinutes = clampInteger(input.cooldownMinutes, 0, 0, 10080);
     const tags = Array.from(new Set((input.tags || []).map((tag) => normalizeText(tag).replace(/^#/, "")).filter(Boolean)));
     const draft: WatchDefinition = {
       id,
+      hasDurableId: true,
       path: "",
       title,
       provider,
@@ -169,24 +318,557 @@ export default class TPSWatchlistPlugin extends Plugin {
     const file = await this.app.vault.create(filePath, content);
     await this.applyGcmRules(file);
     await this.openWatchFile(file.path);
-    const result = await this.checkOne(draft, "create");
+    const result = await this.checkOne(draft, "create", true);
     logger.flow("Create", "write:done", { path: file.path, baselineOutcome: result.outcome });
-    new Notice(result.outcome === "failed"
-      ? "Watch created. Its first baseline check failed; open Watchlist for details."
+    new Notice(result.error
+      ? "Watch created, but its first check needs attention: " + result.error
       : "Watch created and baseline stored.");
     await this.refreshViews();
     return file;
   }
 
   getWatchRows(): WatchRow[] {
+    const snapshot = this.getIdentitySnapshot();
+    return snapshot.definitions
+      .map((definition) => {
+        const conflictingPaths = snapshot.duplicatePathsById.get(definition.id) || [];
+        const blocked = conflictingPaths.length > 1;
+        const stateTrusted = !blocked && this.isStateTrusted(definition);
+        const storedState = this.getStoredState(definition, snapshot);
+        const state = blocked
+          ? createEmptyState()
+          : stateTrusted
+            ? { ...storedState }
+            : createUntrustedOperationalState(storedState);
+        return {
+          definition: cloneWatchDefinition(definition),
+          state,
+          active: isActiveStatus(definition.status),
+          configurationErrors: validateDefinition(definition, conflictingPaths),
+          blocked,
+          stateTrusted,
+          identityNotice: !blocked && !stateTrusted
+            ? "Identity was previously duplicated; the next successful check will establish a new silent baseline."
+            : undefined,
+        };
+      });
+  }
+
+  private scanWatchDefinitions(): WatchDefinition[] {
     return this.app.vault.getMarkdownFiles()
       .map((file) => this.definitionFromFile(file))
-      .filter((definition): definition is WatchDefinition => definition != null)
-      .map((definition) => ({
-        definition,
-        state: this.states[definition.id] || createEmptyState(),
-        active: isActiveStatus(definition.status),
-      }));
+      .filter((definition): definition is WatchDefinition => definition != null);
+  }
+
+  private getIdentitySnapshot(): WatchIdentitySnapshot {
+    if (this.identitySnapshotCache?.revision === this.watchCatalogRevision) {
+      return this.identitySnapshotCache;
+    }
+    const definitions = this.scanWatchDefinitions();
+    const snapshot: WatchIdentitySnapshot = {
+      revision: this.watchCatalogRevision,
+      definitions,
+      definitionsByPath: new Map(definitions.map((definition) => [definition.path, definition])),
+      duplicatePathsById: findDuplicateWatchIdPaths(definitions),
+      durableIds: new Set(definitions
+        .filter((definition) => definition.hasDurableId !== false)
+        .map((definition) => definition.id)),
+    };
+    this.knownWatchPaths = new Set(definitions.map((definition) => definition.path));
+    this.identitySnapshotCache = snapshot;
+    return snapshot;
+  }
+
+  private invalidateWatchCatalog(): void {
+    this.watchCatalogRevision += 1;
+    this.identitySnapshotCache = null;
+  }
+
+  private registerCatalogVaultEvents(): void {
+    this.registerEvent(this.app.vault.on("create", (file) => {
+      if (!(file instanceof TFile) || file.extension !== "md") return;
+      this.catalogSettlements.markPending(file.path);
+      this.invalidateWatchCatalog();
+      this.requestCatalogRecovery("vault-create");
+    }));
+    this.registerEvent(this.app.vault.on("modify", (file) => {
+      if (!(file instanceof TFile) || file.extension !== "md") return;
+      this.catalogSettlements.markPending(file.path);
+      this.invalidateWatchCatalog();
+      this.requestCatalogRecovery("vault-modify");
+    }));
+    this.registerEvent(this.app.vault.on("delete", (file) => {
+      if (file instanceof TFile && file.extension === "md") {
+        const wasWatch = this.knownWatchPaths.delete(file.path)
+          || this.identitySnapshotCache?.definitionsByPath.has(file.path) === true;
+        this.catalogSettlements.forget(file.path);
+        this.invalidateWatchCatalog();
+        if (wasWatch) void this.refreshViews();
+        this.requestCatalogRecovery("vault-delete");
+        return;
+      }
+      if (!(file instanceof TFolder)) return;
+      const prefix = file.path.replace(/\/$/, "") + "/";
+      let wasWatch = false;
+      for (const path of Array.from(this.knownWatchPaths)) {
+        if (!path.startsWith(prefix)) continue;
+        this.knownWatchPaths.delete(path);
+        wasWatch = true;
+      }
+      for (const [path] of this.catalogSettlements.entries()) {
+        if (path.startsWith(prefix)) this.catalogSettlements.forget(path);
+      }
+      this.invalidateWatchCatalog();
+      if (wasWatch) void this.refreshViews();
+      this.requestCatalogRecovery("vault-folder-delete");
+    }));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      if (file instanceof TFolder) {
+        this.handleCatalogFolderRename(file, oldPath);
+        return;
+      }
+      if (!(file instanceof TFile)) return;
+      const oldWasMarkdown = oldPath.toLocaleLowerCase().endsWith(".md");
+      const newIsMarkdown = file.extension === "md";
+      const wasWatch = this.knownWatchPaths.delete(oldPath)
+        || this.identitySnapshotCache?.definitionsByPath.has(oldPath) === true;
+      if (wasWatch && newIsMarkdown) this.knownWatchPaths.add(file.path);
+      this.catalogSettlements.forget(oldPath);
+      if (newIsMarkdown) this.catalogSettlements.markPending(file.path);
+      else this.catalogSettlements.forget(file.path);
+      this.movePathScopedIdentityState(oldPath, file.path);
+      if (!oldWasMarkdown && !newIsMarkdown && !wasWatch) return;
+      this.invalidateWatchCatalog();
+      if (wasWatch) void this.refreshViews();
+      this.requestCatalogRecovery("vault-rename", true);
+    }));
+  }
+
+  private handleCatalogFolderRename(folder: TFolder, oldPath: string): void {
+    const oldPrefix = oldPath.replace(/\/$/, "") + "/";
+    const newPrefix = folder.path.replace(/\/$/, "") + "/";
+    const pathMoves = new Map<string, string>();
+    let wasWatch = false;
+    for (const path of Array.from(this.knownWatchPaths)) {
+      if (!path.startsWith(oldPrefix)) continue;
+      const newPath = newPrefix + path.slice(oldPrefix.length);
+      this.knownWatchPaths.delete(path);
+      this.knownWatchPaths.add(newPath);
+      pathMoves.set(path, newPath);
+      wasWatch = true;
+    }
+    for (const [path] of this.catalogSettlements.entries()) {
+      if (!path.startsWith(oldPrefix)) continue;
+      this.catalogSettlements.forget(path);
+    }
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (!file.path.startsWith(newPrefix)) continue;
+      const priorPath = oldPrefix + file.path.slice(newPrefix.length);
+      pathMoves.set(priorPath, file.path);
+      this.catalogSettlements.markPending(file.path);
+    }
+    this.movePathScopedIdentityStates(Array.from(pathMoves, ([oldPath, newPath]) => ({ oldPath, newPath })));
+    this.invalidateWatchCatalog();
+    if (wasWatch) void this.refreshViews();
+    this.requestCatalogRecovery("vault-folder-rename", true);
+  }
+
+  private async settleCatalogMetadata(
+    file: TFile,
+    indexedData: string,
+    refreshAffectedViews: boolean,
+  ): Promise<"settled" | "superseded"> {
+    const path = file.path;
+    const pendingRevision = this.catalogSettlements.getRevision(path);
+    const ownerKey = this.getFileOwnerKey(file);
+    const expectedMtime = file.stat.mtime;
+    const liveData = await this.app.vault.read(file);
+    if (this.unloading) return "superseded";
+    const current = this.app.vault.getAbstractFileByPath(path);
+    if (current !== file
+      || this.getFileOwnerKey(file) !== ownerKey
+      || file.stat.mtime !== expectedMtime
+      || liveData !== indexedData) {
+      return "superseded";
+    }
+    if (pendingRevision != null && !this.catalogSettlements.settle(path, pendingRevision)) {
+      return "superseded";
+    }
+    const liveDefinition = this.definitionFromData(file, liveData);
+    if (liveDefinition) this.knownWatchPaths.add(path);
+    else this.knownWatchPaths.delete(path);
+    this.invalidateWatchCatalog();
+    if (!refreshAffectedViews && !liveDefinition) return "settled";
+    await this.reconcileDuplicateIdentities("metadata-change");
+    await this.refreshViews();
+    return "settled";
+  }
+
+  private requestCatalogRecovery(reason: string, immediate = false): void {
+    if (this.unloading || !this.catalogVaultEventsReady) return;
+    if (this.catalogRecoveryInFlight) {
+      this.catalogRecoveryRequested = true;
+      return;
+    }
+    if (immediate && this.catalogRecoveryTimerId != null) {
+      window.clearTimeout(this.catalogRecoveryTimerId);
+      this.catalogRecoveryTimerId = null;
+    }
+    if (this.catalogRecoveryTimerId != null) return;
+    const delayMs = immediate
+      ? 0
+      : Math.min(10000, 200 * Math.pow(2, Math.min(this.catalogRecoveryAttempt, 6)));
+    this.catalogRecoveryTimerId = window.setTimeout(() => {
+      this.catalogRecoveryTimerId = null;
+      if (!this.unloading) void this.runCatalogRecovery(reason);
+    }, delayMs);
+  }
+
+  private stopCatalogRecovery(): void {
+    if (this.catalogRecoveryTimerId != null) window.clearTimeout(this.catalogRecoveryTimerId);
+    this.catalogRecoveryTimerId = null;
+    this.catalogRecoveryRequested = false;
+    this.catalogRecoveryReadFailurePaths.clear();
+  }
+
+  private async runCatalogRecovery(reason: string): Promise<void> {
+    if (this.unloading || !this.catalogVaultEventsReady) return;
+    if (this.catalogRecoveryInFlight) {
+      this.catalogRecoveryRequested = true;
+      return await this.catalogRecoveryInFlight;
+    }
+    const recovery = (async () => {
+      this.catalogRecoveryRequested = false;
+      let madeProgress = false;
+      try {
+        const result = await this.recoverPendingCatalogSettlements();
+        if (this.unloading) return;
+        madeProgress = result.settled > 0;
+        if (!this.watchCatalogReady) await this.probeWatchCatalogReadiness();
+        if (this.unloading) return;
+        if (this.watchCatalogReady && !this.hasUntrustedCatalogPending()) {
+          await this.reconcileDuplicateIdentities(reason);
+        }
+        if (this.watchCatalogReady && !this.hasUntrustedCatalogPending()) {
+          this.catalogRecoveryAttempt = 0;
+          return;
+        }
+        this.catalogRecoveryAttempt = madeProgress
+          ? 0
+          : Math.min(7, this.catalogRecoveryAttempt + 1);
+      } catch (error) {
+        if (this.unloading) return;
+        this.catalogRecoveryRequested = true;
+        this.catalogRecoveryAttempt = Math.min(7, this.catalogRecoveryAttempt + 1);
+        logger.failure("Identity", "metadata-recovery:failed", new Error(sanitizeWatchErrorMessage(error)), {
+          reason,
+          pendingPathCount: this.catalogSettlements.entries().length,
+          retryDelayMs: Math.min(10000, 200 * Math.pow(2, Math.min(this.catalogRecoveryAttempt, 6))),
+        });
+      }
+    })().finally(() => {
+      if (this.catalogRecoveryInFlight === recovery) this.catalogRecoveryInFlight = null;
+      if (!this.unloading && (this.catalogRecoveryRequested
+        || !this.watchCatalogReady
+        || this.hasUntrustedCatalogPending())) {
+        this.requestCatalogRecovery("pending-catalog-retry");
+      }
+    });
+    this.catalogRecoveryInFlight = recovery;
+    await recovery;
+  }
+
+  private async recoverPendingCatalogSettlements(): Promise<CatalogRecoveryResult> {
+    let settled = 0;
+    let readFailures = 0;
+    for (const [path, revision] of this.catalogSettlements.entries()) {
+      if (this.unloading) break;
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile) || file.extension !== "md") {
+        this.catalogSettlements.forget(path);
+        this.catalogRecoveryReadFailurePaths.delete(path);
+        settled += 1;
+        continue;
+      }
+      const ownerKey = this.getFileOwnerKey(file);
+      const expectedMtime = file.stat.mtime;
+      let liveData: string;
+      try {
+        liveData = await this.app.vault.read(file);
+      } catch (error) {
+        readFailures += 1;
+        if (!this.catalogRecoveryReadFailurePaths.has(path)) {
+          this.catalogRecoveryReadFailurePaths.add(path);
+          logger.failure("Identity", "metadata-recovery-read:failed", new Error(sanitizeWatchErrorMessage(error)), {
+            path,
+          });
+        }
+        continue;
+      }
+      this.catalogRecoveryReadFailurePaths.delete(path);
+      if (this.unloading) break;
+      const current = this.app.vault.getAbstractFileByPath(path);
+      if (current !== file
+        || this.getFileOwnerKey(file) !== ownerKey
+        || file.stat.mtime !== expectedMtime
+        || this.catalogSettlements.getRevision(path) !== revision) {
+        continue;
+      }
+      const liveDefinition = this.definitionFromData(file, liveData);
+      const cachedDefinition = this.definitionFromFile(file);
+      if (watchDefinitionSignatureOrEmpty(liveDefinition)
+        !== watchDefinitionSignatureOrEmpty(cachedDefinition)) {
+        continue;
+      }
+      if (!this.catalogSettlements.settle(path, revision)) continue;
+      if (liveDefinition) this.knownWatchPaths.add(path);
+      else this.knownWatchPaths.delete(path);
+      settled += 1;
+    }
+    if (settled > 0 && !this.unloading) {
+      this.invalidateWatchCatalog();
+      await this.refreshViews();
+    }
+    return {
+      settled,
+      remaining: this.catalogSettlements.entries().length,
+      readFailures,
+    };
+  }
+
+  private async activateWatchCatalog(reason: string): Promise<void> {
+    if (this.unloading || this.watchCatalogReady || !this.catalogVaultEventsReady
+      || this.hasUntrustedCatalogPending()) return;
+    this.watchCatalogReady = true;
+    this.invalidateWatchCatalog();
+    try {
+      await this.reconcileDuplicateIdentities(reason);
+    } catch (error) {
+      this.catalogRecoveryRequested = true;
+      logger.failure("Identity", "catalog-activation:failed", new Error(sanitizeWatchErrorMessage(error)), {
+        reason,
+      });
+      throw error;
+    }
+  }
+
+  private async probeWatchCatalogReadiness(): Promise<void> {
+    if (this.unloading || this.watchCatalogReady) return;
+    if (this.catalogReadinessProbe) return await this.catalogReadinessProbe;
+    const probe = (async () => {
+      const startingRevision = this.watchCatalogRevision;
+      const files = this.app.vault.getMarkdownFiles();
+      for (const file of files) {
+        if (this.unloading || this.watchCatalogReady) return;
+        const path = file.path;
+        const ownerKey = this.getFileOwnerKey(file);
+        const expectedMtime = file.stat.mtime;
+        const liveData = await this.app.vault.read(file);
+        if (this.unloading) return;
+        const current = this.app.vault.getAbstractFileByPath(path);
+        if (current !== file
+          || this.getFileOwnerKey(file) !== ownerKey
+          || file.stat.mtime !== expectedMtime
+          || this.catalogSettlements.getRevision(path) != null) {
+          return;
+        }
+        const liveDefinition = this.definitionFromData(file, liveData);
+        const cachedDefinition = this.definitionFromFile(file);
+        if (watchDefinitionSignatureOrEmpty(liveDefinition)
+          !== watchDefinitionSignatureOrEmpty(cachedDefinition)) {
+          return;
+        }
+      }
+      if (startingRevision !== this.watchCatalogRevision
+        || this.hasUntrustedCatalogPending()) {
+        return;
+      }
+      await this.activateWatchCatalog("layout-ready-verified-cache");
+    })().finally(() => {
+      if (this.catalogReadinessProbe === probe) this.catalogReadinessProbe = null;
+    });
+    this.catalogReadinessProbe = probe;
+    await probe;
+  }
+
+  private async reconcileDuplicateIdentities(reason: string): Promise<void> {
+    if (this.unloading || !this.watchCatalogReady || this.hasUntrustedCatalogPending()) return;
+    const snapshot = this.getIdentitySnapshot();
+    if (this.unloading || snapshot.revision !== this.watchCatalogRevision
+      || this.hasUntrustedCatalogPending()) return;
+    await this.quarantineDuplicateIdentities(snapshot.duplicatePathsById, reason);
+  }
+
+  private hasUntrustedCatalogPending(
+    localOverlays: ReadonlyMap<string, TrustedCatalogOverlay> = new Map(),
+  ): boolean {
+    const trusted = new Map<string, number>();
+    for (const [path, overlay] of localOverlays) {
+      if (overlay.revision != null
+        && this.catalogSettlements.getRevision(path) === overlay.revision) {
+        trusted.set(path, overlay.revision);
+      }
+    }
+    return this.catalogSettlements.hasUntrustedPending(trusted);
+  }
+
+  private getActiveCatalogDefinitionOverlays(
+    overlays: ReadonlyMap<string, TrustedCatalogOverlay>,
+  ): Map<string, WatchDefinition | null> {
+    const active = new Map<string, WatchDefinition | null>();
+    for (const [path, overlay] of overlays) {
+      if (this.catalogSettlements.getRevision(path) === overlay.revision) {
+        active.set(path, overlay.definition);
+      }
+    }
+    return active;
+  }
+
+  private async quarantineDuplicateIdentities(
+    duplicatePathsById: ReadonlyMap<string, readonly string[]>,
+    reason: string,
+  ): Promise<void> {
+    if (this.unloading) throw new WatchDefinitionChangedError();
+    for (const [id, paths] of duplicatePathsById) {
+      this.identityLeases.taint(id, paths);
+      this.pendingQuarantineIds.add(id);
+      for (const path of paths) this.pendingQuarantinePaths.add(path);
+    }
+    const persist = this.persistPendingIdentitySafetyState(reason);
+    this.trackIdentitySafetyPersistence(persist);
+    try {
+      const { addedIds, addedPaths } = await persist;
+      if (!addedIds.length && !addedPaths.length) return;
+      logger.warn("Identity", "quarantine:added", {
+        reason,
+        identityCount: addedIds.length,
+        pathCount: addedPaths.length,
+        watchIds: addedIds.slice(0, 5),
+        paths: addedPaths.slice(0, 5),
+      });
+    } catch (error) {
+      logger.failure("Identity", "quarantine:persist-failed", new Error(sanitizeWatchErrorMessage(error)), {
+        reason,
+        identityCount: this.pendingQuarantineIds.size,
+        pathCount: this.pendingQuarantinePaths.size,
+      });
+      throw error;
+    }
+  }
+
+  private movePathScopedIdentityState(oldPath: string, newPath: string): void {
+    this.movePathScopedIdentityStates([{ oldPath, newPath }]);
+  }
+
+  private movePathScopedIdentityStates(pathMoves: readonly PendingPathStateMove[]): void {
+    if (!pathMoves.length) return;
+    this.pendingPathStateMoves.push(...pathMoves);
+    const persist = this.persistPendingIdentitySafetyState("path-state-rename");
+    this.trackIdentitySafetyPersistence(persist);
+    void persist.catch((error) => {
+      logger.failure("Identity", "path-state-rename:persist-failed", new Error(sanitizeWatchErrorMessage(error)), {
+        pathMoveCount: pathMoves.length,
+        firstOldPath: pathMoves[0]?.oldPath,
+        firstNewPath: pathMoves[0]?.newPath,
+      });
+    });
+  }
+
+  private trackIdentitySafetyPersistence(persist: Promise<unknown>): void {
+    this.quarantinePersistBarrier = persist.then(() => undefined);
+    void this.quarantinePersistBarrier.catch(() => undefined);
+  }
+
+  private async persistPendingIdentitySafetyState(
+    reason: string,
+  ): Promise<{ addedIds: string[]; addedPaths: string[] }> {
+    const quarantineIds = Array.from(this.pendingQuarantineIds);
+    const quarantinePaths = Array.from(this.pendingQuarantinePaths);
+    const pathMoves = this.pendingPathStateMoves.slice();
+    if (!quarantineIds.length && !quarantinePaths.length && !pathMoves.length) {
+      return { addedIds: [], addedPaths: [] };
+    }
+    const result = await this.mutatePersistentWatchState((draft) => {
+      if (this.unloading) throw new WatchDefinitionChangedError();
+      const addedIds = quarantineWatchIdentities(
+        draft.states,
+        draft.quarantinedWatchIds,
+        quarantineIds,
+      );
+      const addedPaths: string[] = [];
+      for (const path of quarantinePaths) {
+        if (draft.quarantinedWatchPaths.has(path)) continue;
+        draft.quarantinedWatchPaths.add(path);
+        addedPaths.push(path);
+      }
+      let changed = false;
+      for (const move of pathMoves) {
+        if (Object.prototype.hasOwnProperty.call(draft.transientStates, move.oldPath)) {
+          draft.transientStates[move.newPath] = draft.transientStates[move.oldPath];
+          delete draft.transientStates[move.oldPath];
+          changed = true;
+        }
+        if (draft.quarantinedWatchPaths.delete(move.oldPath)) {
+          draft.quarantinedWatchPaths.add(move.newPath);
+          changed = true;
+        }
+      }
+      return {
+        changed: changed || addedIds.length > 0 || addedPaths.length > 0,
+        value: { addedIds, addedPaths },
+      };
+    });
+    for (const id of quarantineIds) this.pendingQuarantineIds.delete(id);
+    for (const path of quarantinePaths) this.pendingQuarantinePaths.delete(path);
+    const completedMoves = new Set(pathMoves);
+    this.pendingPathStateMoves = this.pendingPathStateMoves.filter((move) => !completedMoves.has(move));
+    logger.flow("Identity", "safety-state:persisted", {
+      reason,
+      identityCount: quarantineIds.length,
+      pathCount: quarantinePaths.length,
+      pathMoveCount: pathMoves.length,
+    });
+    return result;
+  }
+
+  private getStateMigration(
+    definition: WatchDefinition,
+    snapshot: WatchIdentitySnapshot,
+  ): WatchStateMigrationPlan {
+    return planWatchStateMigration(
+      definition,
+      this.states,
+      this.transientStates,
+      snapshot.durableIds,
+      this.quarantinedWatchPaths,
+    );
+  }
+
+  private getStoredState(
+    definition: WatchDefinition,
+    snapshot = this.getIdentitySnapshot(),
+  ): WatchState {
+    if (definition.hasDurableId !== false && this.states[definition.id]) {
+      return this.states[definition.id];
+    }
+    return this.getStateMigration(definition, snapshot).state || createEmptyState();
+  }
+
+  private isStateTrusted(definition: WatchDefinition): boolean {
+    return !this.quarantinedWatchIds.has(definition.id)
+      && !this.quarantinedWatchPaths.has(definition.path);
+  }
+
+  private getEvaluationState(
+    definition: WatchDefinition,
+    migration: WatchStateMigrationPlan,
+  ): { state: WatchState; trusted: boolean } {
+    const stored = this.states[definition.id] || migration.state || createEmptyState();
+    const trusted = this.isStateTrusted(definition);
+    return {
+      state: trusted ? stored : createUntrustedOperationalState(stored),
+      trusted,
+    };
   }
 
   async checkAll(reason = "api"): Promise<WatchCheckResult[]> {
@@ -226,15 +908,6 @@ export default class TPSWatchlistPlugin extends Plugin {
   async openWatchFile(path: string): Promise<void> {
     const file = this.app.vault.getAbstractFileByPath(normalizePath(path));
     if (!(file instanceof TFile)) throw new Error("Watch file was not found.");
-    const gcm = this.getGcmApi();
-    if (typeof gcm?.openFileInLeaf === "function") {
-      await gcm.openFileInLeaf(file, false, () => this.app.workspace.getLeaf(false), {
-        revealLeaf: true,
-        active: true,
-        reuseLeafIfNoExisting: true,
-      });
-      return;
-    }
     const leaf = this.app.workspace.getLeaf("tab");
     await leaf.openFile(file);
     this.app.workspace.revealLeaf(leaf);
@@ -284,26 +957,42 @@ export default class TPSWatchlistPlugin extends Plugin {
     this.addCommand({
       id: "open-watchlist",
       name: "Open Watchlist",
-      callback: () => void this.openDashboard(),
+      callback: () => {
+        void this.runUserAction("command-open-dashboard", "Open Watchlist", () => this.openDashboard());
+      },
     });
     this.addCommand({
       id: "open-watchlist-base",
       name: "Open Watchlist Base",
-      callback: () => void this.openBase(this.settings.watchlistBasePath),
+      callback: () => {
+        void this.runUserAction("command-open-watchlist-base", "Open Watchlist Base", () => (
+          this.openBase(this.settings.watchlistBasePath)
+        ));
+      },
     });
     this.addCommand({
       id: "open-watch-events-base",
       name: "Open Watch Events Base",
-      callback: () => void this.openBase(this.settings.watchEventsBasePath),
+      callback: () => {
+        void this.runUserAction("command-open-events-base", "Open Watch Events Base", () => (
+          this.openBase(this.settings.watchEventsBasePath)
+        ));
+      },
     });
     this.addCommand({
       id: "check-all-watches",
       name: "Check all active watches now",
-      callback: async () => {
-        const results = await this.checkAll("command");
-        const events = results.filter((result) => result.outcome === "event").length;
-        const failures = results.filter((result) => result.outcome === "failed").length;
-        new Notice("Watchlist checked " + results.length + " watch(es): " + events + " event(s), " + failures + " failure(s).");
+      callback: () => {
+        void this.runUserAction("command-check-all", "Check all watches", async () => {
+          const results = await this.checkAll("command");
+          const events = results.filter((result) => result.outcome === "event"
+            || (result.sideEffectsCommitted && Boolean(result.eventId))).length;
+          const failures = results.filter((result) => result.outcome === "failed").length;
+          const blocked = results.filter((result) => result.code === "duplicate-watch-id"
+            || result.code === "watch-definition-changed").length;
+          new Notice("Watchlist checked " + results.length + " watch(es): " + events + " event(s), "
+            + failures + " failure(s), " + blocked + " blocked or stale.");
+        });
       },
     });
     this.addCommand({
@@ -312,8 +1001,9 @@ export default class TPSWatchlistPlugin extends Plugin {
       checkCallback: (checking) => {
         const file = this.getActiveWatchFile();
         if (!file) return false;
-        if (!checking) void this.checkPath(file.path, "command-active").then((result) => {
-          new Notice(result.outcome === "failed" ? result.error || "Watch check failed." : "Watch check: " + result.outcome + ".");
+        if (!checking) void this.runUserAction("command-check-active", "Check active watch", async () => {
+          const result = await this.checkPath(file.path, "command-active");
+          new Notice(result.error || "Watch check: " + result.outcome + ".");
         });
         return true;
       },
@@ -324,7 +1014,9 @@ export default class TPSWatchlistPlugin extends Plugin {
       checkCallback: (checking) => {
         const file = this.getActiveWatchFile();
         if (!file) return false;
-        if (!checking) void this.toggleWatchStatus(file.path);
+        if (!checking) void this.runUserAction("command-toggle-active", "Pause or resume watch", () => (
+          this.toggleWatchStatus(file.path)
+        ));
         return true;
       },
     });
@@ -368,16 +1060,22 @@ export default class TPSWatchlistPlugin extends Plugin {
       });
       return;
     }
-    const rows = this.getWatchRows().filter((row) => row.active && isDue(row.definition, row.state));
-    const invalid = rows.filter((row) => validateDefinition(row.definition).length > 0);
+    try {
+      await this.reconcileDuplicateIdentities("scheduler:" + reason);
+    } catch (error) {
+      logger.failure("Scheduler", "identity-reconcile:failed", new Error(sanitizeWatchErrorMessage(error)), { reason });
+      return;
+    }
+    const rows = this.getWatchRows().filter((row) => row.active);
+    const invalid = rows.filter((row) => (row.configurationErrors || []).length > 0);
     if (invalid.length) {
-      logger.warn("Scheduler", "drafts:skipped", {
+      logger.warn("Scheduler", "configuration:skipped", {
         count: invalid.length,
         paths: invalid.slice(0, 5).map((row) => row.definition.path),
       });
     }
     const due = rows
-      .filter((row) => validateDefinition(row.definition).length === 0)
+      .filter((row) => (row.configurationErrors || []).length === 0 && isDue(row.definition, row.state))
       .map((row) => row.definition);
     if (!due.length) return;
     await this.checkDefinitions(due, "scheduler:" + reason, true);
@@ -414,6 +1112,13 @@ export default class TPSWatchlistPlugin extends Plugin {
       concurrency: this.settings.maxConcurrentChecks,
     });
     try {
+      try {
+        await this.reconcileDuplicateIdentities("batch:" + reason);
+      } catch (error) {
+        logger.failure("Identity", "batch-reconcile:failed", new Error(sanitizeWatchErrorMessage(error)), {
+          reason,
+        });
+      }
       const workers = Array.from(
         { length: Math.min(this.settings.maxConcurrentChecks, Math.max(1, queue.length)) },
         async () => {
@@ -441,14 +1146,6 @@ export default class TPSWatchlistPlugin extends Plugin {
       );
       await Promise.all(workers);
       try {
-        await this.persistData();
-      } catch (error) {
-        logger.failure("Check", "batch:persist-failed", new Error(sanitizeWatchErrorMessage(error)), {
-          reason,
-          checked: results.length,
-        });
-      }
-      try {
         await this.refreshViews();
       } catch (error) {
         logger.failure("Check", "batch:view-refresh-failed", new Error(sanitizeWatchErrorMessage(error)), {
@@ -460,9 +1157,12 @@ export default class TPSWatchlistPlugin extends Plugin {
         reason,
         durationMs: Date.now() - started,
         checked: results.length,
-        events: results.filter((result) => result.outcome === "event").length,
+        events: results.filter((result) => result.outcome === "event"
+          || (result.sideEffectsCommitted && Boolean(result.eventId))).length,
         failures: results.filter((result) => result.outcome === "failed").length,
         baselines: results.filter((result) => result.outcome === "baseline").length,
+        identityBlocked: results.filter((result) => result.code === "duplicate-watch-id").length,
+        definitionChanged: results.filter((result) => result.code === "watch-definition-changed").length,
       });
       return results;
     } finally {
@@ -470,30 +1170,132 @@ export default class TPSWatchlistPlugin extends Plugin {
     }
   }
 
-  private async checkOne(inputDefinition: WatchDefinition, reason: string): Promise<WatchCheckResult> {
+  private async checkOne(
+    inputDefinition: WatchDefinition,
+    reason: string,
+    allowCatalogOverlay = false,
+  ): Promise<WatchCheckResult> {
     const path = normalizePath(inputDefinition.path);
+    const trustedCatalogOverlays = new Map<string, TrustedCatalogOverlay>();
+    let liveOverlay: StableLiveWatchDefinition | null = null;
+    if (allowCatalogOverlay) {
+      liveOverlay = await this.captureStableLiveWatchDefinition(path);
+      if (!liveOverlay) return this.watchDefinitionChangedResult(inputDefinition, reason, false);
+      trustedCatalogOverlays.set(path, this.createTrustedCatalogOverlay(
+        path,
+        liveOverlay.definition,
+        liveOverlay.pendingRevision,
+      ));
+    }
+    if (!this.watchCatalogReady
+      || this.hasUntrustedCatalogPending(trustedCatalogOverlays)) {
+      return this.watchDefinitionChangedResult(inputDefinition, reason, false);
+    }
+    const snapshot = this.getIdentitySnapshot();
+    const catalogDefinition = snapshot.definitionsByPath.get(path);
+    const definition = liveOverlay?.definition || catalogDefinition;
+    if (!definition || (!liveOverlay && catalogDefinition
+      && watchDefinitionSignature(catalogDefinition) !== watchDefinitionSignature(inputDefinition))) {
+      return this.watchDefinitionChangedResult(inputDefinition, reason, false);
+    }
+    const effectiveDuplicates = trustedCatalogOverlays.size
+      ? this.getDuplicateWatchIdPathsWithOverlays(snapshot, trustedCatalogOverlays)
+      : snapshot.duplicatePathsById;
+    try {
+      await this.quarantineDuplicateIdentities(effectiveDuplicates, "check-preflight");
+    } catch (error) {
+      return this.identitySafetyPersistenceFailureResult(inputDefinition, reason, false, error);
+    }
+    if (snapshot.revision !== this.watchCatalogRevision
+      || this.hasUntrustedCatalogPending(trustedCatalogOverlays)) {
+      return this.watchDefinitionChangedResult(definition, reason, false);
+    }
+    const conflictingPaths = definition.hasDurableId === false
+      ? []
+      : effectiveDuplicates.get(definition.id) || [];
+    if (conflictingPaths.length > 1) {
+      return await this.duplicateWatchIdResult(definition, conflictingPaths, reason, false);
+    }
+    const file = liveOverlay?.file || this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) {
+      return this.watchDefinitionChangedResult(definition, reason, false);
+    }
+    const signature = watchDefinitionSignature(definition);
+    const flightKey = path + "|" + signature;
     const flight = joinSingleFlight(
       this.checksInFlight,
-      path,
-      () => this.performCheckOne(inputDefinition, reason),
+      flightKey,
+      () => this.performCheckOne(
+        definition,
+        reason,
+        liveOverlay?.expectedMtime ?? file.stat.mtime,
+        liveOverlay?.ownerKey || this.getFileOwnerKey(file),
+        trustedCatalogOverlays,
+      ),
     );
     if (flight.joined) {
       logger.flow("Check", "watch:joined-in-flight", {
         reason,
         path,
-        provider: inputDefinition.provider,
+        provider: definition.provider,
+        definitionSignatureHash: stableHash(signature),
       });
     }
     return await flight.promise;
   }
 
-  private async performCheckOne(inputDefinition: WatchDefinition, reason: string): Promise<WatchCheckResult> {
+  private async performCheckOne(
+    inputDefinition: WatchDefinition,
+    reason: string,
+    initialMtime: number,
+    ownerKey: string,
+    trustedCatalogOverlays: Map<string, TrustedCatalogOverlay>,
+  ): Promise<WatchCheckResult> {
     let definition = inputDefinition;
+    let prepared: PreparedWatchIdentity | null = null;
+    let identityLease: WatchIdentityLease | null = null;
+    let previous = createEmptyState();
+    let providerAttempted = false;
+    let providerResultAccepted = false;
+    const effects = createWatchEffectJournal();
     try {
-      definition = await this.ensureWatchIdentity(inputDefinition);
+      prepared = await this.ensureWatchIdentity(
+        inputDefinition,
+        initialMtime,
+        ownerKey,
+        trustedCatalogOverlays,
+        effects,
+      );
+      definition = prepared.definition;
+      const ownershipFailure = await this.identityOwnershipFailure(prepared, null, reason, false);
+      if (ownershipFailure) return this.withEffectJournal(ownershipFailure, effects);
+
+      identityLease = this.identityLeases.acquire(definition.id, prepared.ownerKey, definition.path);
+      if (identityLease.conflicted) {
+        return this.withEffectJournal(await this.duplicateWatchIdResult(
+          definition,
+          Array.from(identityLease.conflictPaths),
+          reason,
+          false,
+        ), effects);
+      }
+      const leasedOwnershipFailure = await this.identityOwnershipFailure(prepared, identityLease, reason, false);
+      if (leasedOwnershipFailure) return this.withEffectJournal(leasedOwnershipFailure, effects);
+      await this.ensureQuarantinePersisted();
+      const persistedQuarantineOwnershipFailure = await this.identityOwnershipFailure(
+        prepared,
+        identityLease,
+        reason,
+        false,
+      );
+      if (persistedQuarantineOwnershipFailure) {
+        return this.withEffectJournal(persistedQuarantineOwnershipFailure, effects);
+      }
+
       const validation = validateDefinition(definition);
       if (validation.length) throw new Error("Invalid watch: " + validation.join("; "));
-      const previous = this.states[definition.id] || createEmptyState();
+      let evaluationState = this.getEvaluationState(definition, prepared.migration);
+      previous = evaluationState.state;
       logger.flow("Check", "watch:start", {
         reason,
         path: definition.path,
@@ -501,11 +1303,49 @@ export default class TPSWatchlistPlugin extends Plugin {
         condition: definition.condition,
         baselineReady: previous.baselineReady,
         failureCount: previous.failureCount,
+        stateTrusted: evaluationState.trusted,
       });
-      const observation = await fetchWatchObservation(
-        definition,
-        this.settings.requestTimeoutSeconds * 1000,
+
+      let observation: WatchObservation;
+      try {
+        providerAttempted = true;
+        observation = await fetchWatchObservation(
+          definition,
+          this.settings.requestTimeoutSeconds * 1000,
+        );
+      } catch (error) {
+        const providerFailureOwnership = await this.identityOwnershipFailure(
+          prepared,
+          identityLease,
+          reason,
+          true,
+        );
+        if (providerFailureOwnership) return this.withEffectJournal(providerFailureOwnership, effects);
+        evaluationState = this.getEvaluationState(definition, prepared.migration);
+        previous = evaluationState.state;
+        return await this.handleFailure(
+          definition,
+          error,
+          reason,
+          previous,
+          prepared.migration,
+          true,
+          prepared,
+          identityLease,
+          effects,
+        );
+      }
+
+      const commitOwnershipFailure = await this.identityOwnershipFailure(
+        prepared,
+        identityLease,
+        reason,
+        true,
       );
+      if (commitOwnershipFailure) return this.withEffectJournal(commitOwnershipFailure, effects);
+      evaluationState = this.getEvaluationState(definition, prepared.migration);
+      previous = evaluationState.state;
+      providerResultAccepted = true;
       const evaluation = evaluateObservation(definition, observation, previous);
       const fingerprintMigrated = definition.condition === "new-item"
         && previous.baselineReady
@@ -521,28 +1361,41 @@ export default class TPSWatchlistPlugin extends Plugin {
       let outcome: WatchCheckResult["outcome"] = evaluation.eventKind === "baseline" ? "baseline" : "unchanged";
       let eventId = "";
       let appended = false;
+      let eventPresent = false;
       if (evaluation.shouldEmit) {
-        eventId = createEventId(definition.id, observation, evaluation.eventKind);
-        appended = await this.appendWatchEvent(
+        eventId = createEventId(
+          definition.id,
+          observation,
+          evaluation.eventKind,
+          watchEventTransitionKey(previous),
+        );
+        const eventWrite = await this.appendWatchEvent(
           definition,
           observation,
           evaluation.eventKind,
           eventId,
           evaluation.reason,
           previous.lastValue,
+          effects,
         );
+        appended = eventWrite.appended;
+        eventPresent = true;
+        await this.trustExactCatalogMutation(prepared, eventWrite);
         if (appended) {
           outcome = "event";
-          if (definition.notify) {
-            await this.deliverNotification(
-              "Watch triggered: " + definition.title,
-              eventSummary(evaluation.eventKind, observation.displayValue, previous.lastValue),
-              definition.path,
-            );
-          }
+        }
+        const postEventOwnershipFailure = await this.identityOwnershipFailure(
+          prepared,
+          identityLease,
+          reason,
+          true,
+          appended,
+        );
+        if (postEventOwnershipFailure) {
+          return this.withEffectJournal(postEventOwnershipFailure, effects);
         }
       }
-      this.states[definition.id] = {
+      await this.commitWatchStateDurably(definition, {
         ...previous,
         fingerprintVersion: WATCH_FINGERPRINT_VERSION,
         baselineReady: true,
@@ -550,13 +1403,40 @@ export default class TPSWatchlistPlugin extends Plugin {
         lastValue: observation.displayValue,
         lastMatched: evaluation.matched,
         lastCheckedAt: observation.observedAt,
-        lastEventAt: appended ? observation.observedAt : previous.lastEventAt,
-        lastEventId: appended ? eventId : previous.lastEventId,
+        lastEventAt: eventPresent ? observation.observedAt : previous.lastEventAt,
+        lastEventId: eventPresent ? eventId : previous.lastEventId,
         failureCount: 0,
         lastError: "",
         lastErrorNotifiedAt: "",
-      };
-      await this.persistData();
+      }, prepared.migration, !identityLease.conflicted);
+      recordWatchCommittedEffect(effects);
+      const postPersistOwnershipFailure = await this.identityOwnershipFailure(
+        prepared,
+        identityLease,
+        reason,
+        true,
+        true,
+      );
+      if (postPersistOwnershipFailure) {
+        return this.withEffectJournal(postPersistOwnershipFailure, effects);
+      }
+      if (eventPresent && definition.notify) {
+        await this.deliverNotification(
+          "Watch triggered: " + definition.title,
+          eventSummary(evaluation.eventKind, observation.displayValue, previous.lastValue),
+          definition.path,
+        );
+        const postNotificationOwnershipFailure = await this.identityOwnershipFailure(
+          prepared,
+          identityLease,
+          reason,
+          true,
+          true,
+        );
+        if (postNotificationOwnershipFailure) {
+          return this.withEffectJournal(postNotificationOwnershipFailure, effects);
+        }
+      }
       logger.flow("Check", "watch:done", {
         reason,
         path: definition.path,
@@ -565,29 +1445,476 @@ export default class TPSWatchlistPlugin extends Plugin {
         changed: observation.fingerprint !== previous.lastFingerprint,
         eventWritten: appended,
       });
-      return { watchId: definition.id, path: definition.path, outcome, eventId: eventId || undefined };
+      return this.withEffectJournal({
+        watchId: definition.id,
+        path: definition.path,
+        outcome,
+        eventId: appended ? eventId : undefined,
+        attempted: true,
+      }, effects);
     } catch (error) {
-      return await this.handleFailure(definition, error, reason);
+      if (error instanceof WatchDefinitionChangedError) {
+        return this.withEffectJournal(
+          this.watchDefinitionChangedResult(definition, reason, providerAttempted, effects.committed),
+          effects,
+        );
+      }
+      if (!prepared) {
+        const summary = truncate(sanitizeWatchErrorMessage(error), 240);
+        let resultError = summary;
+        let resultCode: WatchCheckResult["code"];
+        logger.failure("Check", "watch:prepare-failed", new Error(summary), {
+          reason,
+          path: definition.path,
+        });
+        if (definition.hasDurableId === false) {
+          try {
+            await this.recordTransientPreparationFailure(definition.path, summary);
+            recordWatchCommittedEffect(effects);
+          } catch (persistError) {
+            const persistSummary = truncate(sanitizeWatchErrorMessage(persistError), 180);
+            resultError += " Preparation health was not persisted: " + persistSummary;
+            resultCode = "state-persistence-failed";
+            logger.failure("Identity", "transient-failure:persist-failed", new Error(persistSummary), {
+              path: definition.path,
+            });
+          }
+        }
+        return this.withEffectJournal({
+          watchId: definition.id,
+          path: definition.path,
+          outcome: "failed",
+          error: resultError,
+          code: resultCode,
+          attempted: providerAttempted,
+        }, effects);
+      }
+      const failureOwnership = await this.identityOwnershipFailure(
+        prepared,
+        identityLease,
+        reason,
+        providerAttempted,
+        effects.committed,
+      );
+      if (failureOwnership) return this.withEffectJournal(failureOwnership, effects);
+      if (providerResultAccepted) {
+        const summary = truncate(sanitizeWatchErrorMessage(error), 240);
+        logger.failure("Check", "watch:commit-failed", new Error(summary), {
+          reason,
+          path: definition.path,
+          provider: definition.provider,
+          sideEffectsCommitted: effects.committed,
+          eventId: effects.eventId,
+        });
+        return this.withEffectJournal({
+          watchId: definition.id,
+          path: definition.path,
+          outcome: "failed",
+          error: "The provider result was accepted, but the check could not finish safely: " + summary,
+          code: error instanceof WatchStatePersistenceError ? "state-persistence-failed" : undefined,
+          attempted: providerAttempted,
+        }, effects);
+      }
+      return await this.handleFailure(
+        definition,
+        error,
+        reason,
+        previous,
+        prepared.migration,
+        providerAttempted,
+        prepared,
+        identityLease,
+        effects,
+      );
+    } finally {
+      if (identityLease && prepared) this.identityLeases.release(identityLease, prepared.ownerKey);
     }
+  }
+
+  private getDuplicateWatchIdPathsWithOverlays(
+    snapshot: WatchIdentitySnapshot,
+    overlays: ReadonlyMap<string, TrustedCatalogOverlay>,
+  ): Map<string, string[]> {
+    const active = this.getActiveCatalogDefinitionOverlays(overlays);
+    return findDuplicateWatchIdPaths(applyWatchDefinitionOverlays(snapshot.definitions, active));
+  }
+
+  private createTrustedCatalogOverlay(
+    path: string,
+    definition: WatchDefinition | null,
+    revision?: number,
+  ): TrustedCatalogOverlay {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    const cachedDefinition = file instanceof TFile ? this.definitionFromFile(file) : null;
+    let effectiveRevision = revision;
+    if (watchDefinitionSignatureOrEmpty(cachedDefinition)
+      !== watchDefinitionSignatureOrEmpty(definition)
+      && effectiveRevision == null) {
+      effectiveRevision = this.catalogSettlements.markPending(path);
+      this.invalidateWatchCatalog();
+      this.requestCatalogRecovery("verified-live-overlay");
+    }
+    return { revision: effectiveRevision, definition };
+  }
+
+  private async trustExactCatalogMutation(
+    prepared: PreparedWatchIdentity,
+    write: WatchEventWriteResult,
+  ): Promise<void> {
+    const { targetFile: file, targetPath: path } = write;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let revision = this.catalogSettlements.getRevision(path);
+      if (write.appended && revision == null) {
+        revision = this.catalogSettlements.markPending(path);
+        this.invalidateWatchCatalog();
+      }
+      const ownerKey = this.getFileOwnerKey(file);
+      const expectedMtime = file.stat.mtime;
+      const liveData = await this.app.vault.read(file);
+      if (this.unloading) throw new WatchDefinitionChangedError();
+      const current = this.app.vault.getAbstractFileByPath(path);
+      if (current !== file
+        || this.getFileOwnerKey(file) !== ownerKey
+        || file.stat.mtime !== expectedMtime
+        || liveData !== write.contentAfterWrite) {
+        throw new WatchDefinitionChangedError();
+      }
+      if (this.catalogSettlements.getRevision(path) !== revision) continue;
+      const liveDefinition = this.definitionFromData(file, liveData);
+      if (path === prepared.definition.path) {
+        if (ownerKey !== prepared.ownerKey
+          || watchDefinitionSignatureOrEmpty(liveDefinition)
+            !== watchDefinitionSignature(prepared.definition)) {
+          throw new WatchDefinitionChangedError();
+        }
+        prepared.expectedMtime = expectedMtime;
+      } else if (liveDefinition) {
+        throw new WatchDefinitionChangedError();
+      }
+      const cachedDefinition = this.definitionFromFile(file);
+      if (watchDefinitionSignatureOrEmpty(cachedDefinition)
+        === watchDefinitionSignatureOrEmpty(liveDefinition)) {
+        if (revision != null) {
+          if (!this.catalogSettlements.settle(path, revision)) continue;
+          this.invalidateWatchCatalog();
+        }
+        prepared.trustedCatalogOverlays.delete(path);
+        if (liveDefinition) this.knownWatchPaths.add(path);
+        else this.knownWatchPaths.delete(path);
+        return;
+      }
+      if (revision == null) {
+        this.catalogSettlements.markPending(path);
+        this.invalidateWatchCatalog();
+        continue;
+      }
+      prepared.trustedCatalogOverlays.set(path, { revision, definition: liveDefinition });
+      this.requestCatalogRecovery("exact-write-cache-pending");
+      return;
+    }
+    throw new WatchDefinitionChangedError();
+  }
+
+  private withEffectJournal(
+    result: WatchCheckResult,
+    effects: WatchEffectJournal,
+  ): WatchCheckResult {
+    return applyWatchEffectJournal(result, effects);
+  }
+
+  private async identityOwnershipFailure(
+    prepared: PreparedWatchIdentity,
+    lease: WatchIdentityLease | null,
+    reason: string,
+    attempted: boolean,
+    sideEffectsMayHaveCommitted = false,
+  ): Promise<WatchCheckResult | null> {
+    const { definition } = prepared;
+    if (!this.watchCatalogReady
+      || this.hasUntrustedCatalogPending(prepared.trustedCatalogOverlays)) {
+      return this.watchDefinitionChangedResult(definition, reason, attempted, sideEffectsMayHaveCommitted);
+    }
+    const file = this.app.vault.getAbstractFileByPath(definition.path);
+    if (!(file instanceof TFile)
+      || this.getFileOwnerKey(file) !== prepared.ownerKey
+      || file.stat.mtime !== prepared.expectedMtime) {
+      return this.watchDefinitionChangedResult(definition, reason, attempted, sideEffectsMayHaveCommitted);
+    }
+    const snapshot = this.getIdentitySnapshot();
+    const catalogDefinition = snapshot.definitionsByPath.get(definition.path);
+    const catalogSignature = catalogDefinition ? watchDefinitionSignature(catalogDefinition) : "";
+    const expectedSignature = watchDefinitionSignature(definition);
+    const activeOverlays = this.getActiveCatalogDefinitionOverlays(prepared.trustedCatalogOverlays);
+    const sourceOverlay = activeOverlays.get(definition.path);
+    const usingTrustedOverlay = Boolean(sourceOverlay
+      && watchDefinitionSignature(sourceOverlay) === expectedSignature);
+    if (catalogSignature !== expectedSignature && !usingTrustedOverlay) {
+      return this.watchDefinitionChangedResult(definition, reason, attempted, sideEffectsMayHaveCommitted);
+    }
+    const effectiveDuplicates = activeOverlays.size
+      ? findDuplicateWatchIdPaths(applyWatchDefinitionOverlays(snapshot.definitions, activeOverlays))
+      : snapshot.duplicatePathsById;
+    try {
+      await this.quarantineDuplicateIdentities(effectiveDuplicates, "ownership-check");
+    } catch (error) {
+      return this.identitySafetyPersistenceFailureResult(
+        definition,
+        reason,
+        attempted,
+        error,
+        sideEffectsMayHaveCommitted,
+      );
+    }
+    const currentFile = this.app.vault.getAbstractFileByPath(definition.path);
+    if (!this.watchCatalogReady
+      || this.hasUntrustedCatalogPending(prepared.trustedCatalogOverlays)
+      || currentFile !== file
+      || !(currentFile instanceof TFile)
+      || this.getFileOwnerKey(currentFile) !== prepared.ownerKey
+      || currentFile.stat.mtime !== prepared.expectedMtime
+      || snapshot.revision !== this.watchCatalogRevision) {
+      return this.watchDefinitionChangedResult(definition, reason, attempted, sideEffectsMayHaveCommitted);
+    }
+    const conflictingPaths = effectiveDuplicates.get(definition.id) || [];
+    if (conflictingPaths.length > 1) {
+      return await this.duplicateWatchIdResult(
+        definition,
+        conflictingPaths,
+        reason,
+        attempted,
+        sideEffectsMayHaveCommitted,
+      );
+    }
+    if (lease?.conflicted) {
+      return await this.duplicateWatchIdResult(
+        definition,
+        Array.from(lease.conflictPaths),
+        reason,
+        attempted,
+        sideEffectsMayHaveCommitted,
+      );
+    }
+    return null;
+  }
+
+  private async duplicateWatchIdResult(
+    definition: WatchDefinition,
+    conflictingPaths: readonly string[],
+    reason: string,
+    attempted: boolean,
+    sideEffectsMayHaveCommitted = false,
+    eventId?: string,
+  ): Promise<WatchCheckResult> {
+    const paths = Array.from(new Set(conflictingPaths)).sort((left, right) => left.localeCompare(right));
+    try {
+      await this.quarantineDuplicateIdentities(new Map([[definition.id, paths]]), "blocked-check");
+    } catch (error) {
+      return this.identitySafetyPersistenceFailureResult(
+        definition,
+        reason,
+        attempted,
+        error,
+        sideEffectsMayHaveCommitted,
+        eventId,
+      );
+    }
+    const phase = sideEffectsMayHaveCommitted
+      ? " The conflict appeared after this check crossed its commit boundary. Any idempotent event or notification already completed is retained, but the identity is quarantined and its next repaired check will establish a new silent baseline."
+      : attempted
+      ? " A provider request had already started, but its result was discarded before observation/failure state, event, or notification commit; the identity quarantine was persisted."
+      : " No provider request, observation evaluation, event, or notification was performed; only the identity quarantine was persisted.";
+    const error = duplicateWatchIdError(definition.id, paths) + phase;
+    logger.warn("Identity", "duplicate:blocked", {
+      reason,
+      watchId: definition.id,
+      path: definition.path,
+      pathCount: paths.length,
+      paths: paths.slice(0, 5),
+      checksBlocked: true,
+      providerAttempted: attempted,
+      sideEffectsMayHaveCommitted,
+    });
+    return {
+      watchId: definition.id,
+      path: definition.path,
+      outcome: "skipped",
+      error,
+      code: "duplicate-watch-id",
+      conflictingPaths: paths,
+      attempted,
+      sideEffectsCommitted: sideEffectsMayHaveCommitted || undefined,
+      eventId,
+    };
+  }
+
+  private identitySafetyPersistenceFailureResult(
+    definition: WatchDefinition,
+    reason: string,
+    attempted: boolean,
+    error: unknown,
+    sideEffectsCommitted = false,
+    eventId?: string,
+  ): WatchCheckResult {
+    const summary = truncate(sanitizeWatchErrorMessage(error), 180);
+    logger.failure("Identity", "safety-persistence:blocked", new Error(summary), {
+      reason,
+      path: definition.path,
+      watchId: definition.id,
+      providerAttempted: attempted,
+      sideEffectsCommitted,
+    });
+    return {
+      watchId: definition.id,
+      path: definition.path,
+      outcome: "failed",
+      error: "Identity safety state could not be persisted, so the watch was stopped: " + summary,
+      attempted,
+      sideEffectsCommitted: sideEffectsCommitted || undefined,
+      eventId,
+    };
+  }
+
+  private watchDefinitionChangedResult(
+    definition: WatchDefinition,
+    reason: string,
+    attempted: boolean,
+    sideEffectsMayHaveCommitted = false,
+  ): WatchCheckResult {
+    const error = sideEffectsMayHaveCommitted
+      ? "The watch definition or vault watch catalog changed after this check crossed its commit boundary. Work already completed is retained, and the next check will use the settled definition."
+      : attempted
+      ? "The watch definition or vault watch catalog changed while its provider request was in progress. The provider result was discarded before this watch committed state, an event, or a notification. Identity-safety quarantine bookkeeping may still have been persisted. Run the check again after metadata settles."
+      : "The watch definition or vault watch catalog changed or is still resolving. No provider request, evaluation, event, or notification was performed for this watch; identity-safety quarantine bookkeeping for detected duplicates may still have been persisted. Run the check again after metadata settles.";
+    logger.warn("Check", "watch:definition-changed", {
+      reason,
+      path: definition.path,
+      watchId: definition.id,
+      providerAttempted: attempted,
+    });
+    return {
+      watchId: definition.id,
+      path: definition.path,
+      outcome: "skipped",
+      error,
+      code: "watch-definition-changed",
+      attempted,
+      sideEffectsCommitted: sideEffectsMayHaveCommitted || undefined,
+    };
+  }
+
+  private applyWatchStateCommitToModel(
+    model: PersistentWatchStateModel,
+    definition: WatchDefinition,
+    state: WatchState,
+    migration: WatchStateMigrationPlan,
+    establishTrustedBaseline: boolean,
+    durableIds: ReadonlySet<string>,
+  ): void {
+    const effectiveMigration = { ...migration };
+    if (establishTrustedBaseline && model.quarantinedWatchPaths.has(definition.path)) {
+      if (Object.prototype.hasOwnProperty.call(model.transientStates, definition.path)) {
+        effectiveMigration.transientPath = definition.path;
+      }
+      const legacyStateKey = "path:" + definition.path;
+      if (legacyStateKey !== definition.id
+        && !durableIds.has(legacyStateKey)
+        && Object.prototype.hasOwnProperty.call(model.states, legacyStateKey)) {
+        effectiveMigration.legacyStateKey = legacyStateKey;
+      }
+    }
+    applyWatchStateCommit(
+      model.states,
+      model.transientStates,
+      model.quarantinedWatchIds,
+      model.quarantinedWatchPaths,
+      definition,
+      state,
+      effectiveMigration,
+      establishTrustedBaseline,
+    );
+  }
+
+  private async commitWatchStateDurably(
+    definition: WatchDefinition,
+    state: WatchState,
+    migration: WatchStateMigrationPlan,
+    establishTrustedBaseline: boolean,
+  ): Promise<void> {
+    const durableIds = new Set(this.getIdentitySnapshot().durableIds);
+    try {
+      await this.mutatePersistentWatchState((draft) => {
+        this.applyWatchStateCommitToModel(
+          draft,
+          definition,
+          { ...state },
+          migration,
+          establishTrustedBaseline,
+          durableIds,
+        );
+        return { changed: true, value: undefined };
+      });
+    } catch (error) {
+      if (error instanceof WatchDefinitionChangedError) throw error;
+      throw new WatchStatePersistenceError(sanitizeWatchErrorMessage(error));
+    }
+  }
+
+  private async ensureQuarantinePersisted(): Promise<void> {
+    await this.quarantinePersistBarrier;
+    if (!this.pendingQuarantineIds.size
+      && !this.pendingQuarantinePaths.size
+      && !this.pendingPathStateMoves.length) return;
+    const persist = this.persistPendingIdentitySafetyState("safety-barrier-retry");
+    this.trackIdentitySafetyPersistence(persist);
+    await persist;
+  }
+
+  private async recordTransientPreparationFailure(path: string, summary: string): Promise<void> {
+    await this.mutatePersistentWatchState((draft) => {
+      const previous = draft.transientStates[path] || createEmptyState();
+      draft.transientStates[path] = {
+        ...previous,
+        lastCheckedAt: new Date().toISOString(),
+        failureCount: previous.failureCount + 1,
+        lastError: summary,
+      };
+      return { changed: true, value: undefined };
+    });
   }
 
   private async handleFailure(
     definition: WatchDefinition,
     error: unknown,
     reason: string,
+    previous: WatchState,
+    migration: WatchStateMigrationPlan,
+    providerAttempted: boolean,
+    prepared: PreparedWatchIdentity,
+    identityLease: WatchIdentityLease | null,
+    effects: WatchEffectJournal,
   ): Promise<WatchCheckResult> {
-    const previous = this.states[definition.id] || createEmptyState();
     const summary = truncate(sanitizeWatchErrorMessage(error), 240);
     const failureCount = previous.failureCount + 1;
     const failedAt = new Date().toISOString();
     let lastErrorNotifiedAt = previous.lastErrorNotifiedAt;
     let failureEscalationFailed = false;
+    let failureEventId = "";
+    let failureEventAppended = false;
     logger.failure("Check", "watch:failed", new Error(summary), {
       reason,
       path: definition.path,
       provider: definition.provider,
       failureCount,
     });
+
+    const initialFailureOwnership = await this.identityOwnershipFailure(
+      prepared,
+      identityLease,
+      reason,
+      providerAttempted,
+      effects.committed,
+    );
+    if (initialFailureOwnership) return this.withEffectJournal(initialFailureOwnership, effects);
 
     try {
       if (failureCount === this.settings.failureAlertThreshold) {
@@ -599,22 +1926,50 @@ export default class TPSWatchlistPlugin extends Plugin {
           fingerprint: stableHash("error|" + summary),
           summary: "Check failed: " + summary,
         };
-        const eventId = createEventId(definition.id, observation, "error");
-        const appended = await this.appendWatchEvent(
+        failureEventId = createEventId(
+          definition.id,
+          observation,
+          "error",
+          watchEventTransitionKey(previous),
+        );
+        const eventWrite = await this.appendWatchEvent(
           definition,
           observation,
           "error",
-          eventId,
+          failureEventId,
           "The watch reached " + failureCount + " consecutive check failures.",
           "",
+          effects,
         );
-        if (appended && this.settings.notifyOnFailure && definition.notify) {
+        failureEventAppended = eventWrite.appended;
+        await this.trustExactCatalogMutation(prepared, eventWrite);
+        const postEventOwnershipFailure = await this.identityOwnershipFailure(
+          prepared,
+          identityLease,
+          reason,
+          providerAttempted,
+          effects.committed,
+        );
+        if (postEventOwnershipFailure) {
+          return this.withEffectJournal(postEventOwnershipFailure, effects);
+        }
+        if (failureEventAppended && this.settings.notifyOnFailure && definition.notify) {
           await this.deliverNotification(
             "Watch needs attention: " + definition.title,
             summary,
             definition.path,
           );
           lastErrorNotifiedAt = failedAt;
+          const postNotificationOwnershipFailure = await this.identityOwnershipFailure(
+            prepared,
+            identityLease,
+            reason,
+            providerAttempted,
+            effects.committed,
+          );
+          if (postNotificationOwnershipFailure) {
+            return this.withEffectJournal(postNotificationOwnershipFailure, effects);
+          }
         }
       }
     } catch (escalationError) {
@@ -628,22 +1983,45 @@ export default class TPSWatchlistPlugin extends Plugin {
       });
     }
 
-    this.states[definition.id] = {
-      ...previous,
-      lastCheckedAt: failedAt,
-      failureCount: failureEscalationFailed ? previous.failureCount : failureCount,
-      lastError: summary,
-      lastErrorNotifiedAt,
-    };
+    const preFailureStateOwnership = await this.identityOwnershipFailure(
+      prepared,
+      identityLease,
+      reason,
+      providerAttempted,
+      effects.committed,
+    );
+    if (preFailureStateOwnership) {
+      return this.withEffectJournal(preFailureStateOwnership, effects);
+    }
+
+    let persistenceFailure = "";
     try {
-      await this.persistData();
+      await this.commitWatchStateDurably(definition, {
+        ...previous,
+        lastCheckedAt: failedAt,
+        failureCount: failureEscalationFailed ? previous.failureCount : failureCount,
+        lastError: summary,
+        lastErrorNotifiedAt,
+      }, migration, false);
+      recordWatchCommittedEffect(effects);
     } catch (persistError) {
-      logger.failure("Check", "failure-state:persist-failed", new Error(sanitizeWatchErrorMessage(persistError)), {
+      persistenceFailure = truncate(sanitizeWatchErrorMessage(persistError), 180);
+      logger.failure("Check", "failure-state:persist-failed", new Error(persistenceFailure), {
         reason,
         path: definition.path,
         provider: definition.provider,
         failureCount,
       });
+    }
+    const postFailureStateOwnership = await this.identityOwnershipFailure(
+      prepared,
+      identityLease,
+      reason,
+      providerAttempted,
+      effects.committed,
+    );
+    if (postFailureStateOwnership) {
+      return this.withEffectJournal(postFailureStateOwnership, effects);
     }
     try {
       await this.refreshViews();
@@ -655,12 +2033,17 @@ export default class TPSWatchlistPlugin extends Plugin {
         failureCount,
       });
     }
-    return {
+    return this.withEffectJournal({
       watchId: definition.id,
       path: definition.path,
       outcome: "failed",
-      error: summary,
-    };
+      error: persistenceFailure
+        ? summary + " Failure health was not persisted: " + persistenceFailure
+        : summary,
+      code: persistenceFailure ? "state-persistence-failed" : undefined,
+      attempted: providerAttempted,
+      eventId: failureEventAppended ? failureEventId : undefined,
+    }, effects);
   }
 
   private async appendWatchEvent(
@@ -670,12 +2053,14 @@ export default class TPSWatchlistPlugin extends Plugin {
     eventId: string,
     reason: string,
     previousValue: string,
-  ): Promise<boolean> {
+    effects: WatchEffectJournal,
+  ): Promise<WatchEventWriteResult> {
     const watchFile = this.app.vault.getAbstractFileByPath(definition.path);
     if (!(watchFile instanceof TFile)) throw new Error("Watch source note disappeared before event write.");
-    const target = this.settings.eventLogTarget === "watch-note"
-      ? watchFile
-      : await this.ensureDailyNote(localIsoDate(observation.observedAt));
+    let target = watchFile;
+    if (this.settings.eventLogTarget !== "watch-note") {
+      target = await this.ensureDailyNote(localIsoDate(observation.observedAt));
+    }
     const watchPath = safeWikiPath(definition.path.replace(/\.md$/i, ""));
     const alias = safeWikiAlias(definition.title);
     const visible = eventSummary(eventKind, observation.displayValue, previousValue);
@@ -699,22 +2084,55 @@ export default class TPSWatchlistPlugin extends Plugin {
       route: this.settings.eventLogTarget,
     });
     let appended = false;
+    let contentAfterWrite = "";
     await this.app.vault.process(target, (current) => {
+      const targetDefinition = this.definitionFromData(target, current);
+      if (target.path === definition.path) {
+        if (watchDefinitionSignatureOrEmpty(targetDefinition)
+          !== watchDefinitionSignature(definition)) {
+          throw new WatchDefinitionChangedError();
+        }
+      } else if (targetDefinition) {
+        throw new WatchDefinitionChangedError();
+      }
       const result = appendLineOnce(current, marker, line);
       appended = result.appended;
+      contentAfterWrite = result.content;
       return result.content;
     });
-    if (!appended) {
-      logger.flow("Event", "write:deduped", { eventId, target: target.path, watchPath: definition.path });
-      return false;
+    if (appended) {
+      recordWatchCommittedEffect(effects, eventId);
     }
-    this.emitFilesUpdated([target.path, definition.path]);
-    logger.flow("Event", "write:done", {
-      eventId,
-      eventKind,
-      target: target.path,
-    });
-    return true;
+    this.reportWatchEventWrite(definition, target, eventId, eventKind, appended);
+    return { appended, targetPath: target.path, targetFile: target, contentAfterWrite };
+  }
+
+  private reportWatchEventWrite(
+    definition: WatchDefinition,
+    target: TFile,
+    eventId: string,
+    eventKind: string,
+    appended: boolean,
+  ): void {
+    try {
+      if (appended) this.emitFilesUpdated([target.path, definition.path]);
+      logger.flow("Event", appended ? "write:done" : "write:deduped", {
+        eventId,
+        eventKind,
+        target: target.path,
+        watchPath: definition.path,
+      });
+    } catch (error) {
+      try {
+        logger.failure("Event", "post-write-signal:failed", new Error(sanitizeWatchErrorMessage(error)), {
+          eventId,
+          target: target.path,
+          watchPath: definition.path,
+        });
+      } catch {
+        // The event is already durably appended; optional signaling cannot invalidate it.
+      }
+    }
   }
 
   private async deliverNotification(title: string, body: string, watchPath: string): Promise<void> {
@@ -725,21 +2143,66 @@ export default class TPSWatchlistPlugin extends Plugin {
       watchPath,
       route: typeof notifier?.sendNotification === "function" ? "tps-notifier" : "obsidian-notice",
     });
-    try {
-      if (typeof notifier?.sendNotification === "function") {
+    if (typeof notifier?.sendNotification === "function") {
+      try {
         await notifier.sendNotification(title, body, file instanceof TFile ? file : undefined);
-      } else {
-        new Notice(title + "\n" + body, 10000);
+        logger.flow("Notification", "send:done", { watchPath });
+        return;
+      } catch (error) {
+        const summary = sanitizeWatchErrorMessage(error);
+        logger.failure("Notification", "send:failed", new Error(summary), { watchPath });
+        throw new Error("Notification delivery failed; no ambiguous fallback was attempted: " + summary);
       }
-      logger.flow("Notification", "send:done", { watchPath });
-    } catch (error) {
-      logger.failure("Notification", "send:failed", error, { watchPath });
-      new Notice(title + "\n" + body, 10000);
     }
+    new Notice(title + "\n" + body, 10000);
+    logger.flow("Notification", "send:done", { watchPath });
   }
 
   private definitionFromFile(file: TFile): WatchDefinition | null {
     const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter || {};
+    return this.definitionFromFrontmatter(file, frontmatter);
+  }
+
+  private definitionFromData(file: TFile, data: string): WatchDefinition | null {
+    try {
+      const info = getFrontMatterInfo(data);
+      if (!info.exists) return null;
+      const parsed = parseYaml(info.frontmatter);
+      const frontmatter = parsed && typeof parsed === "object"
+        ? parsed as Record<string, unknown>
+        : {};
+      return this.definitionFromFrontmatter(file, frontmatter);
+    } catch {
+      return null;
+    }
+  }
+
+  private async captureStableLiveWatchDefinition(path: string): Promise<StableLiveWatchDefinition | null> {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile) || file.extension !== "md") return null;
+    const ownerKey = this.getFileOwnerKey(file);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const expectedMtime = file.stat.mtime;
+      const pendingRevision = this.catalogSettlements.getRevision(path);
+      const data = await this.app.vault.read(file);
+      const current = this.app.vault.getAbstractFileByPath(path);
+      if (current !== file
+        || this.getFileOwnerKey(file) !== ownerKey
+        || file.stat.mtime !== expectedMtime) {
+        return null;
+      }
+      if (this.catalogSettlements.getRevision(path) !== pendingRevision) continue;
+      const definition = this.definitionFromData(file, data);
+      if (!definition) return null;
+      return { definition, file, expectedMtime, ownerKey, pendingRevision };
+    }
+    return null;
+  }
+
+  private definitionFromFrontmatter(
+    file: TFile,
+    frontmatter: Record<string, unknown>,
+  ): WatchDefinition | null {
     if (normalizeText(frontmatter.kind).toLocaleLowerCase() !== "watch") return null;
     const url = scalar(frontmatter.source) || scalar(frontmatter.watchUrl);
     const jsonPath = scalar(frontmatter.watchJsonPath);
@@ -749,9 +2212,10 @@ export default class TPSWatchlistPlugin extends Plugin {
     const condition = WATCH_CONDITIONS.includes(conditionValue)
       ? conditionValue
       : provider === "rss" ? "new-item" : "changed";
-    const id = scalar(frontmatter.watchId) || "path:" + file.path;
+    const durableId = scalar(frontmatter.watchId);
     return {
-      id,
+      id: durableId || "path:" + file.path,
+      hasDurableId: Boolean(durableId),
       path: file.path,
       title: scalar(frontmatter.title) || file.basename,
       provider,
@@ -771,40 +2235,87 @@ export default class TPSWatchlistPlugin extends Plugin {
     };
   }
 
-  private async ensureWatchIdentity(definition: WatchDefinition): Promise<WatchDefinition> {
-    if (!definition.id.startsWith("path:")) return definition;
+  private async ensureWatchIdentity(
+    definition: WatchDefinition,
+    initialMtime: number,
+    ownerKey: string,
+    trustedCatalogOverlays: Map<string, TrustedCatalogOverlay>,
+    effects: WatchEffectJournal,
+  ): Promise<PreparedWatchIdentity> {
     const file = this.app.vault.getAbstractFileByPath(definition.path);
-    if (!(file instanceof TFile)) throw new Error("Watch note was not found.");
-    const generatedId = createLocalId("watch");
+    if (!(file instanceof TFile) || file.stat.mtime !== initialMtime) {
+      throw new WatchDefinitionChangedError();
+    }
+    const snapshot = this.getIdentitySnapshot();
+    const migration = this.getStateMigration(definition, snapshot);
+    if (definition.hasDurableId !== false) {
+      return {
+        definition,
+        migration,
+        expectedMtime: initialMtime,
+        ownerKey,
+        trustedCatalogOverlays,
+      };
+    }
+    const generatedId = this.createUniqueWatchId();
     let resolvedId = generatedId;
+    let resolvedDefinition: WatchDefinition | null = null;
+    let contentChanged = false;
+    let identityWriteRequested = false;
     await this.processFrontmatter(file, (frontmatter) => {
+      const liveDefinition = this.definitionFromFrontmatter(file, frontmatter);
+      if (!liveDefinition
+        || watchDefinitionContentSignature(liveDefinition) !== watchDefinitionContentSignature(definition)) {
+        contentChanged = true;
+        return;
+      }
       const existingId = scalar(frontmatter.watchId);
       if (existingId) resolvedId = existingId;
-      else frontmatter.watchId = generatedId;
+      else {
+        frontmatter.watchId = generatedId;
+        identityWriteRequested = true;
+      }
+      resolvedDefinition = {
+        ...liveDefinition,
+        id: resolvedId,
+        hasDurableId: true,
+      };
     });
-    const pathState = this.states[definition.id];
-    const stateMigrated = Boolean(pathState && !this.states[resolvedId]);
-    if (stateMigrated) this.states[resolvedId] = pathState;
-    if (pathState) delete this.states[definition.id];
+    if (identityWriteRequested) recordWatchIdentityWrite(effects, generatedId);
+    if (contentChanged || !resolvedDefinition) throw new WatchDefinitionChangedError();
+    const preparedDefinition = resolvedDefinition as WatchDefinition;
+    const live = await this.captureStableLiveWatchDefinition(file.path);
+    if (!live
+      || live.ownerKey !== ownerKey
+      || watchDefinitionSignature(live.definition) !== watchDefinitionSignature(preparedDefinition)) {
+      throw new WatchDefinitionChangedError();
+    }
+    trustedCatalogOverlays.set(file.path, this.createTrustedCatalogOverlay(
+      file.path,
+      live.definition,
+      live.pendingRevision,
+    ));
     logger.flow("Identity", "assigned", {
       path: file.path,
       watchId: resolvedId,
       reusedExisting: resolvedId !== generatedId,
-      stateMigrated,
+      stateMigrationPending: Boolean(migration.state),
     });
-    return { ...definition, id: resolvedId };
+    return {
+      definition: preparedDefinition,
+      migration,
+      expectedMtime: live.expectedMtime,
+      ownerKey,
+      trustedCatalogOverlays,
+    };
   }
 
   private async processFrontmatter(
     file: TFile,
     mutator: (frontmatter: Record<string, unknown>) => void,
   ): Promise<void> {
-    const gcm = this.getGcmApi();
-    if (typeof gcm?.frontmatter?.process === "function") {
-      await gcm.frontmatter.process(file, mutator);
-      return;
-    }
     await this.app.fileManager.processFrontMatter(file, mutator);
+    this.invalidateWatchCatalog();
   }
 
   private async applyGcmRules(file: TFile): Promise<void> {
@@ -837,7 +2348,10 @@ export default class TPSWatchlistPlugin extends Plugin {
       label: "Check watch now",
       title: "Fetch the source and evaluate this watch",
       isVisible: visible,
-      onClick: ({ file }: { file: TFile }) => this.checkPath(file.path, "gcm"),
+      onClick: async ({ file }: { file: TFile }) => {
+        const result = await this.checkPath(file.path, "gcm");
+        if (result.error) new Notice(result.error);
+      },
     }));
     this.unregisterGcmActions.push(register({
       id: "toggle-watch",
@@ -930,7 +2444,7 @@ export default class TPSWatchlistPlugin extends Plugin {
       getWatches: () => this.getWatchRows(),
       ensureBases: () => this.ensureBases(),
       openDashboard: () => this.openDashboard(),
-      getSettings: () => this.settings,
+      getSettings: () => ({ ...this.settings }),
     };
     (this as any).api = this.api;
     (this.app as any).tpsWatchlist = this.api;
@@ -938,23 +2452,14 @@ export default class TPSWatchlistPlugin extends Plugin {
 
   private async ensureDailyNote(isoDate: string): Promise<TFile> {
     const gcm = this.getGcmApi();
-    if (typeof gcm?.dailyNotes?.ensureForIsoDate === "function") {
-      const file = await gcm.dailyNotes.ensureForIsoDate(isoDate);
-      if (file instanceof TFile) return file;
+    if (typeof gcm?.dailyNotes?.ensureForIsoDate !== "function") {
+      throw new Error("Daily-note event logging requires the TPS Global Context Menu daily-notes capability.");
     }
-    const options = (this.app as any)?.internalPlugins?.plugins?.["daily-notes"]?.instance?.options || {};
-    const moment = (window as any).moment;
-    const parsed = moment ? moment(isoDate, "YYYY-MM-DD", true) : null;
-    const basename = parsed?.isValid?.() ? parsed.format(String(options.format || "YYYY-MM-DD")) : isoDate;
-    const folder = normalizePath(String(options.folder || "")).replace(/^\/+|\/+$/g, "");
-    const path = normalizePath(folder ? folder + "/" + basename + ".md" : basename + ".md");
-    const existing = this.app.vault.getAbstractFileByPath(path);
-    if (existing instanceof TFile) return existing;
-    await this.ensureFolderForFile(path);
-    return await this.app.vault.create(
-      path,
-      "---\ntitle: " + yamlString(basename) + "\nscheduled: " + isoDate + " 00:00:00\nkind: dailynote\n---\n",
-    );
+    const file = await gcm.dailyNotes.ensureForIsoDate(isoDate);
+    if (!(file instanceof TFile)) {
+      throw new Error("TPS Global Context Menu did not return a daily note file for " + isoDate + ".");
+    }
+    return file;
   }
 
   private async ensureBaseFile(pathValue: string, content: string): Promise<string> {
@@ -1001,9 +2506,32 @@ export default class TPSWatchlistPlugin extends Plugin {
     }
   }
 
+  private createUniqueWatchId(): string {
+    const durableIds = this.getIdentitySnapshot().durableIds;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const id = createLocalId("watch");
+      if (!durableIds.has(id)
+        && !Object.prototype.hasOwnProperty.call(this.states, id)
+        && !this.quarantinedWatchIds.has(id)) {
+        return id;
+      }
+    }
+    throw new Error("Could not allocate a unique watch identity.");
+  }
+
   private getActiveWatchFile(): TFile | null {
     const file = this.app.workspace.getActiveFile();
     return file && this.definitionFromFile(file) ? file : null;
+  }
+
+  private getFileOwnerKey(file: TFile): string {
+    let key = this.fileOwnerKeys.get(file);
+    if (!key) {
+      key = "file-" + this.nextFileOwnerKey;
+      this.nextFileOwnerKey += 1;
+      this.fileOwnerKeys.set(file, key);
+    }
+    return key;
   }
 
   private getGcmApi(): any {
@@ -1046,16 +2574,83 @@ export default class TPSWatchlistPlugin extends Plugin {
   private async loadPluginData(): Promise<void> {
     const raw = await this.loadData() as Partial<PersistedWatchlistData> | null;
     this.settings = sanitizeSettings(raw?.settings || raw || {});
-    this.states = {};
+    this.states = createWatchStateRecord();
     const states = raw?.states && typeof raw.states === "object" ? raw.states : {};
     for (const [key, value] of Object.entries(states)) this.states[key] = sanitizeState(value);
+    this.transientStates = createWatchStateRecord();
+    const transientStates = raw?.transientStates && typeof raw.transientStates === "object"
+      ? raw.transientStates
+      : {};
+    for (const [path, value] of Object.entries(transientStates)) {
+      this.transientStates[path] = sanitizeState(value);
+    }
+    this.quarantinedWatchIds = new Set(
+      Array.isArray(raw?.quarantinedWatchIds)
+        ? raw!.quarantinedWatchIds!.map((id) => normalizeText(id)).filter(Boolean)
+        : [],
+    );
+    this.quarantinedWatchPaths = new Set(
+      Array.isArray(raw?.quarantinedWatchPaths)
+        ? raw!.quarantinedWatchPaths!.map((path) => String(path || "")).filter(Boolean)
+        : [],
+    );
+    if (raw?.identityStateVersion !== WATCH_IDENTITY_STATE_VERSION) {
+      for (const id of this.quarantinedWatchIds) this.states[id] = createEmptyState();
+    }
+  }
+
+  private clonePersistentWatchState(): PersistentWatchStateModel {
+    return {
+      states: cloneWatchStateRecord(this.states),
+      transientStates: cloneWatchStateRecord(this.transientStates),
+      quarantinedWatchIds: new Set(this.quarantinedWatchIds),
+      quarantinedWatchPaths: new Set(this.quarantinedWatchPaths),
+    };
+  }
+
+  private installPersistentWatchState(model: PersistentWatchStateModel): void {
+    this.states = model.states;
+    this.transientStates = model.transientStates;
+    this.quarantinedWatchIds = model.quarantinedWatchIds;
+    this.quarantinedWatchPaths = model.quarantinedWatchPaths;
+  }
+
+  private persistentDataPayload(model: PersistentWatchStateModel): PersistedWatchlistData {
+    return {
+      settings: { ...this.settings },
+      states: cloneWatchStateRecord(model.states),
+      transientStates: cloneWatchStateRecord(model.transientStates),
+      quarantinedWatchIds: Array.from(model.quarantinedWatchIds).sort((left, right) => left.localeCompare(right)),
+      quarantinedWatchPaths: Array.from(model.quarantinedWatchPaths).sort((left, right) => left.localeCompare(right)),
+      identityStateVersion: WATCH_IDENTITY_STATE_VERSION,
+    };
+  }
+
+  private enqueueDataOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.saveSerial.then(operation, operation);
+    this.saveSerial = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async mutatePersistentWatchState<T>(
+    mutate: (draft: PersistentWatchStateModel) => PersistentStateMutation<T>,
+  ): Promise<T> {
+    return await this.enqueueDataOperation(async () => {
+      if (this.unloading) throw new WatchDefinitionChangedError();
+      const draft = this.clonePersistentWatchState();
+      const result = mutate(draft);
+      if (!result.changed) return result.value;
+      await this.saveData(this.persistentDataPayload(draft));
+      this.installPersistentWatchState(draft);
+      return result.value;
+    });
   }
 
   private async persistData(): Promise<void> {
-    this.saveSerial = this.saveSerial
-      .catch(() => undefined)
-      .then(() => this.saveData({ settings: this.settings, states: this.states }));
-    await this.saveSerial;
+    await this.enqueueDataOperation(async () => {
+      const snapshot = this.clonePersistentWatchState();
+      await this.saveData(this.persistentDataPayload(snapshot));
+    });
   }
 }
 
@@ -1114,6 +2709,17 @@ function sanitizeState(value: unknown): WatchState {
     lastError: truncate(normalizeText(raw.lastError), 240),
     lastErrorNotifiedAt: normalizeText(raw.lastErrorNotifiedAt),
   };
+}
+
+function cloneWatchDefinition(definition: WatchDefinition): WatchDefinition {
+  return {
+    ...definition,
+    tags: definition.tags.slice(),
+  };
+}
+
+function watchDefinitionSignatureOrEmpty(definition: WatchDefinition | null): string {
+  return definition ? watchDefinitionSignature(definition) : "";
 }
 
 function buildWatchNote(definition: WatchDefinition): string {
@@ -1184,10 +2790,8 @@ function eventSummary(kind: string, value: string, previous: string): string {
 }
 
 function localIsoDate(isoTimestamp: string): string {
-  const moment = (window as any).moment;
-  const parsed = moment ? moment(isoTimestamp) : null;
-  if (parsed?.isValid?.()) return parsed.format("YYYY-MM-DD");
   const date = new Date(isoTimestamp);
+  if (!Number.isFinite(date.getTime())) return isoTimestamp.slice(0, 10);
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
@@ -1195,10 +2799,13 @@ function localIsoDate(isoTimestamp: string): string {
 }
 
 function localDateTime(isoTimestamp: string): string {
-  const moment = (window as any).moment;
-  const parsed = moment ? moment(isoTimestamp) : null;
-  if (parsed?.isValid?.()) return parsed.format("YYYY-MM-DD HH:mm:ss");
-  return isoTimestamp.replace("T", " ").replace(/\.\d{3}Z$/, "Z");
+  const date = new Date(isoTimestamp);
+  if (!Number.isFinite(date.getTime())) return isoTimestamp.replace("T", " ");
+  const datePart = localIsoDate(isoTimestamp);
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+  return datePart + " " + hours + ":" + minutes + ":" + seconds;
 }
 
 function watchlistBaseContent(): string {

@@ -15,6 +15,7 @@ export type WatchEventLogTarget = "daily-note" | "watch-note";
 
 export interface WatchDefinition {
   id: string;
+  hasDurableId?: boolean;
   path: string;
   title: string;
   provider: WatchProvider;
@@ -71,6 +72,10 @@ export interface WatchCheckResult {
   outcome: "baseline" | "event" | "unchanged" | "failed" | "skipped";
   eventId?: string;
   error?: string;
+  code?: "duplicate-watch-id" | "watch-definition-changed" | "state-persistence-failed";
+  conflictingPaths?: string[];
+  attempted?: boolean;
+  sideEffectsCommitted?: boolean;
 }
 
 export interface WatchlistSettings {
@@ -93,6 +98,10 @@ export interface WatchlistSettings {
 export interface PersistedWatchlistData {
   settings: WatchlistSettings;
   states: Record<string, WatchState>;
+  transientStates?: Record<string, WatchState>;
+  quarantinedWatchIds?: string[];
+  quarantinedWatchPaths?: string[];
+  identityStateVersion?: number;
 }
 
 export interface CreateWatchInput {
@@ -116,6 +125,10 @@ export interface WatchRow {
   definition: WatchDefinition;
   state: WatchState;
   active: boolean;
+  configurationErrors?: string[];
+  blocked?: boolean;
+  stateTrusted?: boolean;
+  identityNotice?: string;
 }
 
 export interface WatchlistApi {

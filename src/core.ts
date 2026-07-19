@@ -1,5 +1,6 @@
 import type {
   WatchCondition,
+  WatchCheckResult,
   WatchDefinition,
   WatchEvaluation,
   WatchObservation,
@@ -7,6 +8,40 @@ import type {
 } from "./types";
 
 export const WATCH_FINGERPRINT_VERSION = 2;
+
+export interface WatchEffectJournal {
+  committed: boolean;
+  eventId?: string;
+  watchId?: string;
+}
+
+export function createWatchEffectJournal(): WatchEffectJournal {
+  return { committed: false };
+}
+
+export function recordWatchCommittedEffect(effects: WatchEffectJournal, eventId?: string): void {
+  effects.committed = true;
+  if (eventId) effects.eventId = eventId;
+}
+
+export function recordWatchIdentityWrite(effects: WatchEffectJournal, watchId: string): void {
+  effects.committed = true;
+  effects.watchId = watchId;
+}
+
+export function applyWatchEffectJournal(
+  result: WatchCheckResult,
+  effects: WatchEffectJournal,
+): WatchCheckResult {
+  if (!effects.committed) return result;
+  const applied: WatchCheckResult = {
+    ...result,
+    watchId: effects.watchId || result.watchId,
+    sideEffectsCommitted: true,
+  };
+  if (effects.eventId) applied.eventId = effects.eventId;
+  return applied;
+}
 
 export function normalizeText(value: unknown): string {
   return String(value == null ? "" : value).replace(/\s+/g, " ").trim();
@@ -221,8 +256,294 @@ export function createEmptyState(): WatchState {
   };
 }
 
-export function createEventId(watchId: string, observation: WatchObservation, eventKind: string): string {
-  return "watch-event-" + stableHash(watchId + "|" + eventKind + "|" + observation.fingerprint);
+export function createUntrustedOperationalState(state: WatchState): WatchState {
+  return {
+    ...createEmptyState(),
+    lastCheckedAt: state.lastCheckedAt,
+    failureCount: state.failureCount,
+    lastError: state.lastError,
+    lastErrorNotifiedAt: state.lastErrorNotifiedAt,
+  };
+}
+
+export function createWatchStateRecord(): Record<string, WatchState> {
+  return Object.create(null) as Record<string, WatchState>;
+}
+
+export function cloneWatchStateRecord(
+  states: Readonly<Record<string, WatchState>>,
+): Record<string, WatchState> {
+  const clone = createWatchStateRecord();
+  for (const [key, state] of Object.entries(states)) clone[key] = { ...state };
+  return clone;
+}
+
+export function applyWatchDefinitionOverlays(
+  definitions: readonly WatchDefinition[],
+  overlays: ReadonlyMap<string, WatchDefinition | null>,
+): WatchDefinition[] {
+  if (overlays.size === 0) return definitions.slice();
+  const result = definitions.filter((definition) => !overlays.has(definition.path));
+  for (const definition of overlays.values()) {
+    if (definition) result.push(definition);
+  }
+  return result;
+}
+
+export interface WatchStateMigrationPlan {
+  state?: WatchState;
+  transientPath?: string;
+  legacyStateKey?: string;
+}
+
+export function planWatchStateMigration(
+  definition: WatchDefinition,
+  durableStates: Readonly<Record<string, WatchState>>,
+  transientStates: Readonly<Record<string, WatchState>>,
+  durableIds: ReadonlySet<string>,
+  quarantinedWatchPaths: ReadonlySet<string> = new Set(),
+): WatchStateMigrationPlan {
+  if (quarantinedWatchPaths.has(definition.path)) return {};
+  const transientState = transientStates[definition.path];
+  const legacyStateKey = "path:" + definition.path;
+  const legacyState = !durableIds.has(legacyStateKey)
+    ? durableStates[legacyStateKey]
+    : undefined;
+  return {
+    state: transientState || legacyState,
+    transientPath: transientState ? definition.path : undefined,
+    legacyStateKey: legacyState ? legacyStateKey : undefined,
+  };
+}
+
+export function applyWatchStateCommit(
+  durableStates: Record<string, WatchState>,
+  transientStates: Record<string, WatchState>,
+  quarantinedWatchIds: Set<string>,
+  quarantinedWatchPaths: Set<string>,
+  definition: WatchDefinition,
+  state: WatchState,
+  migration: WatchStateMigrationPlan,
+  establishTrustedBaseline: boolean,
+): void {
+  durableStates[definition.id] = state;
+  if (migration.transientPath) delete transientStates[migration.transientPath];
+  if (migration.legacyStateKey && migration.legacyStateKey !== definition.id) {
+    delete durableStates[migration.legacyStateKey];
+  }
+  if (establishTrustedBaseline) {
+    quarantinedWatchIds.delete(definition.id);
+    quarantinedWatchPaths.delete(definition.path);
+  }
+}
+
+export function quarantineWatchIdentities(
+  states: Record<string, WatchState>,
+  quarantinedWatchIds: Set<string>,
+  watchIds: Iterable<string>,
+): string[] {
+  const added: string[] = [];
+  for (const id of watchIds) {
+    if (quarantinedWatchIds.has(id)) continue;
+    quarantinedWatchIds.add(id);
+    states[id] = createEmptyState();
+    added.push(id);
+  }
+  return added;
+}
+
+export function quarantineWatchIdentityConflicts(
+  states: Record<string, WatchState>,
+  quarantinedWatchIds: Set<string>,
+  quarantinedWatchPaths: Set<string>,
+  conflicts: ReadonlyMap<string, readonly string[]>,
+): { addedIds: string[]; addedPaths: string[] } {
+  const addedIds = quarantineWatchIdentities(states, quarantinedWatchIds, conflicts.keys());
+  const addedPaths: string[] = [];
+  for (const paths of conflicts.values()) {
+    for (const path of paths) {
+      if (quarantinedWatchPaths.has(path)) continue;
+      quarantinedWatchPaths.add(path);
+      addedPaths.push(path);
+    }
+  }
+  return { addedIds, addedPaths };
+}
+
+export class WatchCatalogSettlementTracker {
+  private revision = 0;
+  private readonly pending = new Map<string, number>();
+
+  markPending(path: string): number {
+    this.revision += 1;
+    this.pending.set(path, this.revision);
+    return this.revision;
+  }
+
+  settle(path: string, expectedRevision: number): boolean {
+    if (this.pending.get(path) !== expectedRevision) return false;
+    this.pending.delete(path);
+    return true;
+  }
+
+  forget(path: string): void {
+    this.pending.delete(path);
+  }
+
+  move(oldPath: string, newPath: string): number | undefined {
+    const pendingRevision = this.pending.get(oldPath);
+    this.pending.delete(oldPath);
+    if (pendingRevision == null) return undefined;
+    this.revision += 1;
+    this.pending.set(newPath, this.revision);
+    return this.revision;
+  }
+
+  getRevision(path: string): number | undefined {
+    return this.pending.get(path);
+  }
+
+  entries(): Array<[string, number]> {
+    return Array.from(this.pending.entries());
+  }
+
+  hasUntrustedPending(trustedRevisions: ReadonlyMap<string, number> = new Map()): boolean {
+    for (const [path, revision] of this.pending) {
+      if (trustedRevisions.get(path) !== revision) return true;
+    }
+    return false;
+  }
+}
+
+export function watchDefinitionSignature(definition: WatchDefinition): string {
+  return stableSerialize(definition);
+}
+
+export function watchDefinitionContentSignature(definition: WatchDefinition): string {
+  const { id: _id, hasDurableId: _hasDurableId, ...content } = definition;
+  return stableSerialize(content);
+}
+
+export interface WatchIdentityLease {
+  id: string;
+  activePaths: Set<string>;
+  activeOwnerCounts: Map<string, number>;
+  ownerPaths: Map<string, string>;
+  conflictPaths: Set<string>;
+  conflicted: boolean;
+}
+
+export class WatchIdentityLeaseRegistry {
+  private readonly leases = new Map<string, WatchIdentityLease>();
+
+  acquire(id: string, ownerKey: string, path = ownerKey): WatchIdentityLease {
+    let lease = this.leases.get(id);
+    if (!lease) {
+      lease = {
+        id,
+        activePaths: new Set([path]),
+        activeOwnerCounts: new Map([[ownerKey, 1]]),
+        ownerPaths: new Map([[ownerKey, path]]),
+        conflictPaths: new Set([path]),
+        conflicted: false,
+      };
+      this.leases.set(id, lease);
+      return lease;
+    }
+    const activeCount = lease.activeOwnerCounts.get(ownerKey) || 0;
+    if (activeCount === 0) {
+      if (lease.activeOwnerCounts.size > 0) lease.conflicted = true;
+      lease.activePaths.add(path);
+      lease.conflictPaths.add(path);
+      lease.ownerPaths.set(ownerKey, path);
+    } else {
+      const previousPath = lease.ownerPaths.get(ownerKey);
+      if (previousPath !== path) {
+        if (previousPath) lease.activePaths.delete(previousPath);
+        lease.activePaths.add(path);
+        lease.ownerPaths.set(ownerKey, path);
+        if (!lease.conflicted && previousPath) lease.conflictPaths.delete(previousPath);
+        lease.conflictPaths.add(path);
+      }
+    }
+    lease.activeOwnerCounts.set(ownerKey, activeCount + 1);
+    return lease;
+  }
+
+  taint(id: string, conflictingPaths: readonly string[]): void {
+    const lease = this.leases.get(id);
+    if (!lease || conflictingPaths.length < 2) return;
+    lease.conflicted = true;
+    for (const path of conflictingPaths) lease.conflictPaths.add(path);
+  }
+
+  release(lease: WatchIdentityLease, ownerKey: string): void {
+    const activeCount = lease.activeOwnerCounts.get(ownerKey) || 0;
+    if (activeCount <= 1) {
+      lease.activeOwnerCounts.delete(ownerKey);
+      const path = lease.ownerPaths.get(ownerKey);
+      if (path) lease.activePaths.delete(path);
+      lease.ownerPaths.delete(ownerKey);
+    } else {
+      lease.activeOwnerCounts.set(ownerKey, activeCount - 1);
+    }
+    if (lease.activeOwnerCounts.size === 0 && this.leases.get(lease.id) === lease) {
+      this.leases.delete(lease.id);
+    }
+  }
+}
+
+export function watchEventTransitionKey(state: WatchState): string {
+  return stableSerialize({
+    lastFingerprint: state.lastFingerprint,
+    lastMatched: state.lastMatched,
+    lastEventAt: state.lastEventAt,
+    lastEventId: state.lastEventId,
+    failureCount: state.failureCount,
+  });
+}
+
+export function createEventId(
+  watchId: string,
+  observation: WatchObservation,
+  eventKind: string,
+  transitionKey: string,
+): string {
+  return "watch-event-" + stableHash(
+    watchId + "|" + eventKind + "|" + observation.fingerprint + "|" + transitionKey,
+  );
+}
+
+export function findDuplicateWatchIdPaths(
+  definitions: readonly WatchDefinition[],
+): Map<string, string[]> {
+  const pathsById = new Map<string, Set<string>>();
+  for (const definition of definitions) {
+    if (definition.hasDurableId === false) continue;
+    const id = normalizeText(definition.id);
+    const path = String(definition.path || "");
+    if (!id || !path) continue;
+    const paths = pathsById.get(id) || new Set<string>();
+    paths.add(path);
+    pathsById.set(id, paths);
+  }
+
+  const conflicts = new Map<string, string[]>();
+  for (const [id, paths] of pathsById) {
+    if (paths.size > 1) conflicts.set(id, Array.from(paths).sort((left, right) => left.localeCompare(right)));
+  }
+  return conflicts;
+}
+
+export function duplicateWatchIdError(watchId: string, conflictingPaths: readonly string[]): string {
+  const paths = Array.from(new Set(conflictingPaths.map((path) => String(path || "")).filter(Boolean)))
+    .sort((left, right) => left.localeCompare(right));
+  if (paths.length < 2) return "";
+  const visiblePaths = paths.slice(0, 3).map((path) => truncate(path, 100));
+  const remainder = paths.length > visiblePaths.length ? " and " + (paths.length - visiblePaths.length) + " more" : "";
+  return "Duplicate watchId \"" + truncate(normalizeText(watchId), 80) + "\" is used by "
+    + paths.length + " watch notes: " + visiblePaths.join(", ") + remainder
+    + ". Checks are blocked until every conflicting note has a unique watchId. Any identity observed in conflict must establish a new silent baseline before its prior state is trusted again.";
 }
 
 export function isActiveStatus(status: string): boolean {
@@ -230,7 +551,10 @@ export function isActiveStatus(status: string): boolean {
   return !["complete", "completed", "holding", "paused", "wont-do", "cancelled", "canceled", "archived"].includes(normalized);
 }
 
-export function validateDefinition(definition: WatchDefinition): string[] {
+export function validateDefinition(
+  definition: WatchDefinition,
+  conflictingPaths: readonly string[] = [],
+): string[] {
   const errors: string[] = [];
   if (!definition.title) errors.push("title is required");
   if (!/^https?:\/\//i.test(definition.url)) errors.push("source must be an HTTP or HTTPS URL");
@@ -238,6 +562,8 @@ export function validateDefinition(definition: WatchDefinition): string[] {
   if (["contains", "not-contains", "equals", "above", "below"].includes(definition.condition) && !definition.target) {
     errors.push("watchTarget is required for " + definition.condition);
   }
+  const identityError = duplicateWatchIdError(definition.id, conflictingPaths);
+  if (identityError) errors.push(identityError);
   return errors;
 }
 

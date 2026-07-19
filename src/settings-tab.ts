@@ -48,7 +48,7 @@ export class WatchlistSettingTab extends PluginSettingTab {
     textSetting(storage, this.plugin, "Watch events Base", "TPS Table Base that renders typed watch-event lines.", "watchEventsBasePath");
     new Setting(storage)
       .setName("Event log owner")
-      .setDesc("Daily notes are the recommended canonical owner for meaningful detected changes.")
+      .setDesc("Daily notes are recommended, but require TPS Global Context Menu's daily-notes capability. Watch note body works without that integration.")
       .addDropdown((dropdown) => dropdown
         .addOption("daily-note", "Relevant daily note")
         .addOption("watch-note", "Watch note body")
