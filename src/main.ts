@@ -49,6 +49,16 @@ import { WATCHLIST_VIEW_TYPE, WatchlistView } from "./view";
 import * as logger from "./logger";
 import { TPSNotifierClient } from "./tps-notifier-client";
 import type { TPSNotifierConsumerDeliveryResult } from "./tps-notifier-contract";
+import { TPSAiGatewayClient } from "./tps-ai-gateway-client";
+import type { TPSAiGatewayApiSnapshot } from "./tps-ai-gateway-contract";
+import {
+  disposeCallbacksSafely,
+  registerCallbacksTransactionally,
+  TPSAiCapabilityExecutionLease,
+  TPSAiCapabilityRegistrationSet,
+  TPSGcmActionExecutionLease,
+  type TPSAiGatewayCapabilityRegistration,
+} from "./ai-capability-registration";
 import {
   blockedNotificationPlan,
   cloneNotificationRecordMap,
@@ -181,6 +191,13 @@ export default class TPSWatchlistPlugin extends Plugin {
   private recoveredNotificationAttemptCount = 0;
   private startupPrunedNotificationRecordCount = 0;
   private notifierClient!: TPSNotifierClient<TFile>;
+  private aiGatewayClient!: TPSAiGatewayClient;
+  private aiCapabilityRegistrations = new TPSAiCapabilityRegistrationSet();
+  private aiAvailabilityEpoch = 0;
+  private availableAiGatewayApi?: Readonly<TPSAiGatewayApiSnapshot>;
+  private aiIntegrationsReady = false;
+  private aiCatalogReady = false;
+  private activeAiCapabilityExecutionLease?: TPSAiCapabilityExecutionLease;
   private schedulerIntervalId: number | null = null;
   private startupTimeoutId: number | null = null;
   private batchInFlight = false;
@@ -208,7 +225,8 @@ export default class TPSWatchlistPlugin extends Plugin {
   private pendingQuarantinePaths = new Set<string>();
   private pendingPathStateMoves: PendingPathStateMove[] = [];
   private unregisterGcmActions: Array<() => void> = [];
-  private unregisterAiCapabilities: Array<() => void> = [];
+  private gcmRegistrationBlocked = false;
+  private activeGcmActionExecutionLease?: TPSGcmActionExecutionLease;
   private api!: WatchlistApi;
 
   async onload(): Promise<void> {
@@ -251,13 +269,19 @@ export default class TPSWatchlistPlugin extends Plugin {
       void this.runScheduledChecks("controller-role-changed");
     }) as any));
 
+    const layoutLifecycleEpoch = this.lifecycleEpoch;
     this.app.workspace.onLayoutReady(() => {
-      if (this.unloading) return;
+      if (!this.isCurrentLifecycle(layoutLifecycleEpoch)) return;
       this.registerCatalogVaultEvents();
       this.catalogVaultEventsReady = true;
       this.requestCatalogRecovery("layout-ready", true);
-      void this.initializeIntegrations();
+      void this.initializeIntegrations(layoutLifecycleEpoch);
     });
+    this.aiGatewayClient = new TPSAiGatewayClient(this.app, this.manifest.id);
+    this.aiGatewayClient.start(
+      (eventRef) => this.registerEvent(eventRef),
+      (api) => this.handleAiGatewayAvailability(api),
+    );
     this.startScheduler();
     logger.flow("Lifecycle", "loaded", {
       executionMode: this.settings.executionMode,
@@ -276,11 +300,25 @@ export default class TPSWatchlistPlugin extends Plugin {
   onunload(): void {
     this.unloading = true;
     this.lifecycleEpoch += 1;
+    this.aiAvailabilityEpoch += 1;
+    this.availableAiGatewayApi = undefined;
+    this.aiIntegrationsReady = false;
+    this.aiCatalogReady = false;
+    this.invalidateAiCapabilityExecutionLease();
+    this.disposeAiCapabilityRegistrations("plugin-unload");
+    this.aiGatewayClient?.dispose();
     this.stopCatalogRecovery();
     this.stopScheduler();
     this.notifierClient?.dispose();
-    for (const unregister of this.unregisterGcmActions.splice(0)) unregister();
-    for (const unregister of this.unregisterAiCapabilities.splice(0)) unregister();
+    this.invalidateGcmActionExecutionLease();
+    const gcmCleanup = disposeCallbacksSafely(this.unregisterGcmActions.splice(0));
+    if (gcmCleanup.failureCount > 0) {
+      this.gcmRegistrationBlocked = true;
+      logger.warn("GCM", "actions:unregister-incomplete", {
+        attempted: gcmCleanup.attemptCount,
+        failed: gcmCleanup.failureCount,
+      });
+    }
     this.app.workspace.detachLeavesOfType(WATCHLIST_VIEW_TYPE);
     if ((this.app as any).tpsWatchlist === this.api) delete (this.app as any).tpsWatchlist;
     delete (this as any).api;
@@ -607,6 +645,10 @@ export default class TPSWatchlistPlugin extends Plugin {
         if (this.unloading) return;
         if (this.watchCatalogReady && !this.hasUntrustedCatalogPending()) {
           await this.reconcileDuplicateIdentities(reason);
+          if (!this.unloading && !this.hasUntrustedCatalogPending()) {
+            this.aiCatalogReady = true;
+            this.registerAvailableAiCapabilities("catalog-reconciled");
+          }
         }
         if (this.watchCatalogReady && !this.hasUntrustedCatalogPending()) {
           this.catalogRecoveryAttempt = 0;
@@ -702,6 +744,9 @@ export default class TPSWatchlistPlugin extends Plugin {
     this.invalidateWatchCatalog();
     try {
       await this.reconcileDuplicateIdentities(reason);
+      if (this.unloading || !this.watchCatalogReady || this.hasUntrustedCatalogPending()) return;
+      this.aiCatalogReady = true;
+      this.registerAvailableAiCapabilities("catalog-ready");
     } catch (error) {
       this.catalogRecoveryRequested = true;
       logger.failure("Identity", "catalog-activation:failed", new Error(sanitizeWatchErrorMessage(error)), {
@@ -990,21 +1035,29 @@ export default class TPSWatchlistPlugin extends Plugin {
     return { watchlist, events };
   }
 
-  private async initializeIntegrations(): Promise<void> {
+  private async initializeIntegrations(lifecycleEpoch: number): Promise<void> {
     try {
       await this.ensureBases(false);
     } catch (error) {
-      logger.failure("Bases", "ensure:failed", error);
+      if (this.isCurrentLifecycle(lifecycleEpoch)) logger.failure("Bases", "ensure:failed", error);
     }
-    this.registerGcmActions();
-    this.registerAiCapabilities();
-    if (!this.unregisterGcmActions.length || !this.unregisterAiCapabilities.length) {
+    if (!this.isCurrentLifecycle(lifecycleEpoch)) return;
+    try {
+      this.registerGcmActions(lifecycleEpoch);
+    } catch (error) {
+      logger.failure("GCM", "actions:register-failed", error, { route: "integration-initialization" });
+    }
+    if (!this.isCurrentLifecycle(lifecycleEpoch)) return;
+    if (!this.unregisterGcmActions.length && !this.gcmRegistrationBlocked) {
       const retry = window.setTimeout(() => {
-        if (!this.unregisterGcmActions.length) this.registerGcmActions();
-        if (!this.unregisterAiCapabilities.length) this.registerAiCapabilities();
+        if (this.isCurrentLifecycle(lifecycleEpoch) && !this.unregisterGcmActions.length) {
+          this.registerGcmActions(lifecycleEpoch);
+        }
       }, 3000);
       this.register(() => window.clearTimeout(retry));
     }
+    this.aiIntegrationsReady = true;
+    this.registerAvailableAiCapabilities("integrations-ready");
   }
 
   private registerCommands(): void {
@@ -2619,67 +2672,195 @@ export default class TPSWatchlistPlugin extends Plugin {
     }
   }
 
-  private registerGcmActions(): void {
-    if (this.unregisterGcmActions.length) return;
-    const register = this.getGcmApi()?.externalActions?.register;
+  private registerGcmActions(lifecycleEpoch: number): void {
+    if (!this.isCurrentLifecycle(lifecycleEpoch)
+      || this.unregisterGcmActions.length
+      || this.gcmRegistrationBlocked) return;
+    let register: any;
+    try {
+      register = this.getGcmApi()?.externalActions?.register;
+    } catch (error) {
+      logger.failure("GCM", "actions:register-failed", error, { route: "api-discovery" });
+      return;
+    }
     if (typeof register !== "function") {
       logger.warn("GCM", "actions:register-unavailable");
       return;
     }
+    let executionLease!: TPSGcmActionExecutionLease;
+    executionLease = new TPSGcmActionExecutionLease(() => (
+      this.activeGcmActionExecutionLease === executionLease
+      && this.isCurrentLifecycle(lifecycleEpoch)
+    ));
     const visible = ({ file }: { file: TFile }) => {
+      if (!executionLease.isExecutable()) return false;
       const frontmatter = this.app.metadataCache.getFileCache(file)?.frontmatter || {};
       return normalizeText(frontmatter.kind).toLocaleLowerCase() === "watch";
     };
-    this.unregisterGcmActions.push(register({
-      id: "check-watch",
-      pluginId: this.manifest.id,
-      order: 32,
-      icon: "refresh-cw",
-      label: "Check watch now",
-      title: "Fetch the source and evaluate this watch",
-      isVisible: visible,
-      onClick: async ({ file }: { file: TFile }) => {
-        const result = await this.checkPath(file.path, "gcm");
-        if (result.error) new Notice(result.error);
-      },
-    }));
-    this.unregisterGcmActions.push(register({
-      id: "toggle-watch",
-      pluginId: this.manifest.id,
-      order: 33,
-      icon: ({ file }: { file: TFile }) => {
-        const definition = this.definitionFromFile(file);
-        return definition && isActiveStatus(definition.status) ? "pause" : "play";
-      },
-      label: ({ file }: { file: TFile }) => {
-        const definition = this.definitionFromFile(file);
-        return definition && isActiveStatus(definition.status) ? "Pause watch" : "Resume watch";
-      },
-      title: "Pause or resume automatic monitoring",
-      isVisible: visible,
-      onClick: ({ file }: { file: TFile }) => this.toggleWatchStatus(file.path),
-    }));
-    this.unregisterGcmActions.push(register({
-      id: "open-watchlist",
-      pluginId: this.manifest.id,
-      order: 34,
-      icon: "binoculars",
-      label: "Open Watchlist",
-      title: "Open the TPS Watchlist dashboard",
-      isVisible: visible,
-      onClick: () => this.openDashboard(),
-    }));
-    logger.flow("GCM", "actions:registered", { count: this.unregisterGcmActions.length });
+    const result = registerCallbacksTransactionally([
+      () => register({
+        id: "check-watch",
+        pluginId: this.manifest.id,
+        order: 32,
+        icon: "refresh-cw",
+        label: "Check watch now",
+        title: "Fetch the source and evaluate this watch",
+        isVisible: visible,
+        onClick: async ({ file }: { file: TFile }) => {
+          executionLease.assertExecutable();
+          const checkResult = await this.checkPath(file.path, "gcm");
+          if (checkResult.error) new Notice(checkResult.error);
+        },
+      }),
+      () => register({
+        id: "toggle-watch",
+        pluginId: this.manifest.id,
+        order: 33,
+        icon: ({ file }: { file: TFile }) => {
+          if (!executionLease.isExecutable()) return "play";
+          const definition = this.definitionFromFile(file);
+          return definition && isActiveStatus(definition.status) ? "pause" : "play";
+        },
+        label: ({ file }: { file: TFile }) => {
+          if (!executionLease.isExecutable()) return "Resume watch";
+          const definition = this.definitionFromFile(file);
+          return definition && isActiveStatus(definition.status) ? "Pause watch" : "Resume watch";
+        },
+        title: "Pause or resume automatic monitoring",
+        isVisible: visible,
+        onClick: ({ file }: { file: TFile }) => {
+          executionLease.assertExecutable();
+          return this.toggleWatchStatus(file.path);
+        },
+      }),
+      () => register({
+        id: "open-watchlist",
+        pluginId: this.manifest.id,
+        order: 34,
+        icon: "binoculars",
+        label: "Open Watchlist",
+        title: "Open the TPS Watchlist dashboard",
+        isVisible: visible,
+        onClick: () => {
+          executionLease.assertExecutable();
+          return this.openDashboard();
+        },
+      }),
+    ], () => this.isCurrentLifecycle(lifecycleEpoch));
+    if (result.status === "failed" || result.cleanupFailureCount > 0) {
+      this.gcmRegistrationBlocked = true;
+    }
+    if (result.status === "registered") {
+      executionLease.activate();
+      this.activeGcmActionExecutionLease = executionLease;
+      this.unregisterGcmActions.push(...result.callbacks);
+      logger.flow("GCM", "actions:registered", { count: this.unregisterGcmActions.length });
+    } else {
+      executionLease.invalidate();
+    }
+    if (result.status === "failed") {
+      logger.failure("GCM", "actions:register-failed", result.error, {
+        attempted: result.registrationAttemptCount,
+        cleanupAttempted: result.cleanupAttemptCount,
+        cleanupFailed: result.cleanupFailureCount,
+      });
+    } else if (result.cleanupFailureCount > 0) {
+      logger.warn("GCM", "actions:register-superseded-cleanup-incomplete", {
+        attempted: result.registrationAttemptCount,
+        cleanupAttempted: result.cleanupAttemptCount,
+        cleanupFailed: result.cleanupFailureCount,
+      });
+    }
   }
 
-  private registerAiCapabilities(): void {
-    if (this.unregisterAiCapabilities.length) return;
-    const gateway = this.getAiGatewayApi();
-    if (typeof gateway?.registerCapability !== "function") {
+  private invalidateGcmActionExecutionLease(): void {
+    this.activeGcmActionExecutionLease?.invalidate();
+    this.activeGcmActionExecutionLease = undefined;
+  }
+
+  private handleAiGatewayAvailability(api: Readonly<TPSAiGatewayApiSnapshot> | undefined): void {
+    this.aiAvailabilityEpoch += 1;
+    this.availableAiGatewayApi = api;
+    this.invalidateAiCapabilityExecutionLease();
+    if (this.unloading) {
+      this.disposeAiCapabilityRegistrations("availability-after-unload");
+      return;
+    }
+    if (!api) {
+      this.disposeAiCapabilityRegistrations("provider-unavailable");
       logger.warn("AI", "capabilities:register-unavailable");
       return;
     }
-    this.unregisterAiCapabilities.push(gateway.registerCapability({
+    if (!this.isAiCapabilityPublicationReady()) {
+      this.disposeAiCapabilityRegistrations("provider-change-before-readiness");
+      logger.flow("AI", "capabilities:registration-deferred", {
+        catalogReady: this.aiCatalogReady,
+        integrationsReady: this.aiIntegrationsReady,
+      });
+      return;
+    }
+    this.registerAvailableAiCapabilities("provider-available");
+  }
+
+  private registerAvailableAiCapabilities(route: string): void {
+    const api = this.availableAiGatewayApi;
+    if (!api || !this.isAiCapabilityPublicationReady()) return;
+    if (this.activeAiCapabilityExecutionLease) return;
+    const availabilityEpoch = this.aiAvailabilityEpoch;
+    const lifecycleEpoch = this.lifecycleEpoch;
+    let executionLease!: TPSAiCapabilityExecutionLease;
+    executionLease = new TPSAiCapabilityExecutionLease(() => (
+      this.isAiCapabilityExecutionReady(executionLease, api, availabilityEpoch, lifecycleEpoch)
+    ));
+    const isCurrent = () => (
+      !this.unloading
+      && this.availableAiGatewayApi === api
+      && availabilityEpoch === this.aiAvailabilityEpoch
+      && lifecycleEpoch === this.lifecycleEpoch
+      && this.isAiCapabilityPublicationReady()
+    );
+    const result = this.aiCapabilityRegistrations.synchronize(
+      api,
+      this.createAiCapabilityDescriptors(executionLease),
+      isCurrent,
+      () => this.invalidateAiCapabilityExecutionLease(),
+    );
+    if (result.status === "registered") {
+      if (!isCurrent()) {
+        executionLease.invalidate();
+        this.disposeAiCapabilityRegistrations("registration-superseded-after-commit");
+        return;
+      }
+      executionLease.activate();
+      this.activeAiCapabilityExecutionLease = executionLease;
+      logger.flow("AI", "capabilities:registered", {
+        count: result.registeredCount,
+        replacedPrevious: result.unregisterAttemptCount > 0,
+        route,
+      });
+    } else if (result.status === "failed") {
+      executionLease.invalidate();
+      logger.failure("AI", "capabilities:register-failed", result.error, {
+        cleanupAttempted: result.unregisterAttemptCount,
+        cleanupBlocked: result.cleanupBlocked,
+        route,
+      });
+    } else {
+      executionLease.invalidate();
+      if (result.status === "cleanup-failed") {
+        logger.warn("AI", "capabilities:registration-blocked-by-cleanup", {
+          attempted: result.unregisterAttemptCount,
+          failed: result.unregisterFailureCount,
+          route,
+        });
+      }
+    }
+  }
+
+  private createAiCapabilityDescriptors(
+    executionLease: TPSAiCapabilityExecutionLease,
+  ): readonly TPSAiGatewayCapabilityRegistration[] {
+    return [{
       id: "watchlist.create-watch",
       ownerPluginId: this.manifest.id,
       description: "Create a TPS watch note for a confirmed URL, extraction method, condition, and threshold.",
@@ -2706,11 +2887,11 @@ export default class TPSWatchlistPlugin extends Plugin {
         },
       },
       execute: async (input: CreateWatchInput) => {
+        executionLease.assertExecutable();
         const file = await this.createWatch(input);
         return { path: file.path, watchId: this.definitionFromFile(file)?.id || "" };
       },
-    }));
-    this.unregisterAiCapabilities.push(gateway.registerCapability({
+    }, {
       id: "watchlist.check-watch",
       ownerPluginId: this.manifest.id,
       description: "Run a confirmed check for one existing TPS watch note.",
@@ -2721,9 +2902,56 @@ export default class TPSWatchlistPlugin extends Plugin {
         required: ["path"],
         properties: { path: { type: "string" } },
       },
-      execute: async (input: { path: string }) => await this.checkPath(input.path, "ai-capability"),
-    }));
-    logger.flow("AI", "capabilities:registered", { count: this.unregisterAiCapabilities.length });
+      execute: async (input: { path: string }) => {
+        executionLease.assertExecutable();
+        return await this.checkPath(input.path, "ai-capability");
+      },
+    }];
+  }
+
+  private isAiCapabilityPublicationReady(): boolean {
+    return !this.unloading
+      && this.aiIntegrationsReady
+      && this.aiCatalogReady
+      && this.catalogVaultEventsReady
+      && this.watchCatalogReady
+      && !this.hasUntrustedCatalogPending();
+  }
+
+  private isAiCapabilityExecutionReady(
+    executionLease: TPSAiCapabilityExecutionLease,
+    api: Readonly<TPSAiGatewayApiSnapshot>,
+    availabilityEpoch: number,
+    lifecycleEpoch: number,
+  ): boolean {
+    return this.activeAiCapabilityExecutionLease === executionLease
+      && this.availableAiGatewayApi === api
+      && availabilityEpoch === this.aiAvailabilityEpoch
+      && lifecycleEpoch === this.lifecycleEpoch
+      && this.isAiCapabilityPublicationReady();
+  }
+
+  private invalidateAiCapabilityExecutionLease(): void {
+    this.activeAiCapabilityExecutionLease?.invalidate();
+    this.activeAiCapabilityExecutionLease = undefined;
+  }
+
+  private disposeAiCapabilityRegistrations(route: string): void {
+    this.invalidateAiCapabilityExecutionLease();
+    const result = this.aiCapabilityRegistrations.dispose();
+    if (result.cleanupBlocked) {
+      logger.warn("AI", "capabilities:unregister-incomplete", {
+        attempted: result.unregisterAttemptCount,
+        failed: result.unregisterFailureCount,
+        replacementBlocked: true,
+        route,
+      });
+    } else if (result.unregisterAttemptCount > 0) {
+      logger.flow("AI", "capabilities:unregistered", {
+        count: result.unregisterAttemptCount,
+        route,
+      });
+    }
   }
 
   private exposeApi(): void {
@@ -2830,12 +3058,6 @@ export default class TPSWatchlistPlugin extends Plugin {
 
   private getControllerApi(): any {
     return (this.app as any)?.plugins?.getPlugin?.("tps-controller")?.api || null;
-  }
-
-  private getAiGatewayApi(): any {
-    return (this.app as any).tpsAiGateway
-      || (this.app as any)?.plugins?.getPlugin?.("tps-ai-gateway")?.api
-      || null;
   }
 
   private emitFilesUpdated(paths: string[]): void {

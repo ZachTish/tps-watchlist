@@ -5,7 +5,7 @@
   "main": "main.js",
   "scripts": {
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "test:core": "node esbuild.test.mjs && node --test .test/watch-core.test.cjs .test/notification-delivery.test.cjs",
+    "test:core": "node esbuild.test.mjs && node --test .test/watch-core.test.cjs .test/notification-delivery.test.cjs .test/ai-gateway-integration.test.cjs",
     "test": "npm run test:core && npm run build"
   },
   "license": "MIT",
