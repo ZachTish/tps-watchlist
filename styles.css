@@ -159,6 +159,15 @@
   color: var(--watch-danger);
 }
 
+.tps-watch-notification-warning {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--watch-danger) 45%, var(--background-modifier-border));
+  border-radius: 9px;
+  color: var(--watch-danger);
+  background: color-mix(in srgb, var(--watch-danger) 7%, transparent);
+}
+
 .tps-watch-card-actions {
   gap: 3px;
 }

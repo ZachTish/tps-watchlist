@@ -1,6 +1,7 @@
 import { ItemView, Notice, setIcon, WorkspaceLeaf } from "obsidian";
 import type TPSWatchlistPlugin from "./main";
 import type { WatchRow } from "./types";
+import { isDeliveredNotificationState } from "./notification-ledger";
 
 export const WATCHLIST_VIEW_TYPE = "tps-watchlist-view";
 
@@ -37,13 +38,16 @@ export class WatchlistView extends ItemView {
     const paused = rows.filter((row) => !row.active && !row.blocked).length;
     const failing = rows.filter((row) => !row.blocked
       && (row.state.failureCount > 0 || (row.configurationErrors || []).length > 0)).length;
+    const deliveryAttention = rows.filter((row) => row.latestNotification
+      && !isDeliveredNotificationState(row.latestNotification.state)).length;
 
     const header = root.createDiv({ cls: "tps-watchlist-header" });
     const titleGroup = header.createDiv({ cls: "tps-watchlist-title-group" });
     titleGroup.createEl("h2", { text: "Watchlist" });
     titleGroup.createEl("p", {
       text: active + " active · " + blocked + " blocked · "
-        + paused + " paused or retired · " + failing + " need attention",
+        + paused + " paused or retired · " + failing + " watch issue(s) · "
+        + deliveryAttention + " delivery issue(s)",
     });
     const headerActions = header.createDiv({ cls: "tps-watchlist-header-actions" });
     actionButton(headerActions, this.plugin, "plus", "New watch", () => this.plugin.openCreateModal());
@@ -57,6 +61,14 @@ export class WatchlistView extends ItemView {
         + " failure(s), " + skipped + " blocked or stale.");
       await this.render();
     }, true);
+
+    const notificationLedgerWarning = this.plugin.getNotificationLedgerWarning();
+    if (notificationLedgerWarning) {
+      root.createDiv({
+        cls: "tps-watch-notification-warning",
+        text: "Notification delivery is fail-closed: " + notificationLedgerWarning,
+      });
+    }
 
     const tools = root.createDiv({ cls: "tps-watchlist-tools" });
     const search = tools.createEl("input", {
@@ -83,10 +95,16 @@ export class WatchlistView extends ItemView {
         row.definition.target,
         row.definition.path,
         row.definition.tags.join(" "),
+        row.latestNotification?.state || "",
+        row.latestNotification?.evidence || "",
       ].join(" ").toLocaleLowerCase().includes(query))
       .sort((left, right) =>
         Number(Boolean(right.blocked)) - Number(Boolean(left.blocked))
         || Number(right.state.failureCount > 0) - Number(left.state.failureCount > 0)
+        || Number(Boolean(right.latestNotification
+          && !isDeliveredNotificationState(right.latestNotification.state)))
+          - Number(Boolean(left.latestNotification
+            && !isDeliveredNotificationState(left.latestNotification.state)))
         || Number(right.active) - Number(left.active)
         || left.definition.title.localeCompare(right.definition.title));
 
@@ -128,6 +146,17 @@ export class WatchlistView extends ItemView {
     metadata.createSpan({ text: conditionLabel(row.definition.condition, row.definition.target) });
     metadata.createSpan({ text: "Every " + row.definition.intervalMinutes + "m" });
     if (!row.definition.notify) metadata.createSpan({ text: "Silent" });
+    if (row.latestNotification) {
+      const label = notificationStateLabel(row.latestNotification.state);
+      metadata.createSpan({
+        cls: isDeliveredNotificationState(row.latestNotification.state) ? "" : "tps-watch-error",
+        text: "Notify: " + label,
+        attr: {
+          title: "Transport: " + row.latestNotification.transport
+            + " · Evidence: " + row.latestNotification.evidence,
+        },
+      });
+    }
 
     const latest = main.createDiv({ cls: "tps-watch-card-latest" });
     if (configurationErrors.length) {
@@ -159,6 +188,18 @@ export class WatchlistView extends ItemView {
     });
     actionButton(actions, this.plugin, "external-link", "Open", () => this.plugin.openWatchFile(row.definition.path));
   }
+}
+
+function notificationStateLabel(state: string): string {
+  const labels: Record<string, string> = {
+    attempting: "Attempting",
+    accepted: "Accepted",
+    "legacy-accepted": "Accepted (legacy)",
+    rejected: "Rejected",
+    "not-attempted": "Not attempted",
+    unknown: "Unknown",
+  };
+  return labels[state] || state;
 }
 
 function actionButton(

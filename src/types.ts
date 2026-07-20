@@ -1,3 +1,9 @@
+import type {
+  TPSNotifierConsumerEvidence,
+  TPSNotifierConsumerDeliveryState,
+  TPSNotifierConsumerTransport,
+} from "./tps-notifier-contract";
+
 export type WatchProvider = "page" | "json" | "rss";
 
 export type WatchCondition =
@@ -66,6 +72,43 @@ export interface WatchEvaluation {
   reason: string;
 }
 
+export type WatchNotificationState = TPSNotifierConsumerDeliveryState;
+export type WatchNotificationKind = "watch-event" | "failure-alert";
+export type WatchNotificationTransport = TPSNotifierConsumerTransport;
+export type WatchNotificationEvidence = TPSNotifierConsumerEvidence
+  | "consumer-timeout"
+  | "ledger-capacity"
+  | "attempt-started"
+  | "deduped-without-ledger"
+  | "ownership-changed";
+
+export interface WatchNotificationRecord {
+  eventId: string;
+  watchId: string;
+  kind: WatchNotificationKind;
+  state: WatchNotificationState;
+  transport: WatchNotificationTransport;
+  evidence: WatchNotificationEvidence;
+  attemptId: string;
+  attemptCount: number;
+  createdAt: string;
+  updatedAt: string;
+  attempted: boolean | "unknown";
+  code?: string;
+  httpStatus?: number;
+  providerMessageId?: string;
+}
+
+export interface WatchNotificationSummary {
+  eventId: string;
+  kind: WatchNotificationKind;
+  state: WatchNotificationState;
+  transport: WatchNotificationTransport;
+  evidence: WatchNotificationEvidence;
+  attempted: boolean | "unknown";
+  updatedAt: string;
+}
+
 export interface WatchCheckResult {
   watchId: string;
   path: string;
@@ -76,6 +119,7 @@ export interface WatchCheckResult {
   conflictingPaths?: string[];
   attempted?: boolean;
   sideEffectsCommitted?: boolean;
+  notification?: WatchNotificationSummary;
 }
 
 export interface WatchlistSettings {
@@ -102,6 +146,8 @@ export interface PersistedWatchlistData {
   quarantinedWatchIds?: string[];
   quarantinedWatchPaths?: string[];
   identityStateVersion?: number;
+  notificationLedgerVersion?: unknown;
+  notificationDeliveries?: unknown;
 }
 
 export interface CreateWatchInput {
@@ -129,6 +175,7 @@ export interface WatchRow {
   blocked?: boolean;
   stateTrusted?: boolean;
   identityNotice?: string;
+  latestNotification?: WatchNotificationSummary;
 }
 
 export interface WatchlistApi {

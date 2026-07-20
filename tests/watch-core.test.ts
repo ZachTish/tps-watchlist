@@ -721,7 +721,14 @@ test("Watchlist revisions effective defaults and avoids ambiguous unsupported fa
   assert.match(settingsSource, /this\.invalidateWatchCatalog\(\)/);
   assert.doesNotMatch(source, /internalPlugins|window as any\)\.moment/);
   assert.match(source, /Daily-note event logging requires the TPS Global Context Menu daily-notes capability/);
-  assert.match(source, /no ambiguous fallback was attempted/);
+  assert.match(source, /new TPSNotifierClient<TFile>\(this\.app, this\.manifest\.id\)/);
+  assert.doesNotMatch(source, /getNotifierApi/);
+  const deliverySource = source.slice(
+    source.indexOf("private async deliverNotification("),
+    source.indexOf("private definitionFromFile("),
+  );
+  assert.match(deliverySource, /result\.state === "not-attempted" && result\.attempted === false/);
+  assert.doesNotMatch(deliverySource, /catch[\s\S]*new Notice/);
   assert.doesNotMatch(source, /gcm\?\.frontmatter\?\.process/);
   assert.doesNotMatch(source, /new Set\(this\.app\.vault\.getMarkdownFiles\(\)\)/);
 });
@@ -742,7 +749,7 @@ test("Watchlist installs state only after durable save and keeps the save queue 
   const source = readFileSync("src/main.ts", "utf8");
   const transaction = source.slice(
     source.indexOf("private async mutatePersistentWatchState"),
-    source.indexOf("private async persistData()"),
+    source.indexOf("private async persistData("),
   );
   assert.ok(
     transaction.indexOf("await this.saveData(this.persistentDataPayload(draft))")
@@ -750,15 +757,8 @@ test("Watchlist installs state only after durable save and keeps the save queue 
     "draft state must not become live before saveData succeeds",
   );
   assert.match(source, /this\.saveSerial = run\.then\(\(\) => undefined, \(\) => undefined\)/);
-  const successCommit = source.slice(
-    source.indexOf("await this.commitWatchStateDurably(definition"),
-    source.indexOf("const postPersistOwnershipFailure"),
-  );
-  assert.ok(
-    successCommit.indexOf("await this.commitWatchStateDurably")
-      < successCommit.indexOf("recordWatchCommittedEffect(effects)"),
-    "state effects must be recorded only after durable persistence",
-  );
+  assert.match(source, /const plan = await this\.commitWatchStateAndPrepareNotification\([\s\S]*?recordWatchCommittedEffect\(effects\);\s*return plan/);
+  assert.match(source, /await this\.commitWatchStateDurably\([\s\S]*?recordWatchCommittedEffect\(effects\);/);
 });
 
 test("Watchlist retains identity-safety intent until its transaction succeeds", () => {
@@ -787,4 +787,94 @@ test("Watchlist contains async UI failures and discloses the daily-note dependen
   assert.match(viewSource, /plugin\.runUserAction\(/);
   assert.match(viewSource, /\.finally\(\(\) => \{\s*button\.disabled = false/);
   assert.match(settingsSource, /require TPS Global Context Menu's daily-notes capability/);
+});
+
+test("Watchlist wires notification recovery and attempt accounting into both event paths", () => {
+  const source = readFileSync("src/main.ts", "utf8");
+  const viewSource = readFileSync("src/view.ts", "utf8");
+  const onload = source.slice(source.indexOf("async onload()"), source.indexOf("onunload(): void"));
+  assert.ok(onload.indexOf("await this.loadPluginData(lifecycleEpoch)") < onload.indexOf("this.startScheduler()"));
+  assert.match(onload, /const lifecycleEpoch = \+\+this\.lifecycleEpoch/);
+  assert.ok(onload.indexOf("await this.saveSerial") < onload.indexOf("await this.loadPluginData(lifecycleEpoch)"));
+  assert.match(onload, /!this\.isCurrentLifecycle\(lifecycleEpoch\)\) return/);
+  assert.ok(onload.indexOf("new TPSNotifierClient") < onload.indexOf("this.startScheduler()"));
+
+  const atomicCommit = source.slice(
+    source.indexOf("private async commitWatchStateAndPrepareNotification("),
+    source.indexOf("private async settleNotificationAttemptDurably("),
+  );
+  assert.ok(
+    atomicCommit.indexOf("this.applyWatchStateCommitToModel(")
+      < atomicCommit.indexOf("prepareNotificationDelivery(draft.notificationDeliveries, input)"),
+  );
+  assert.match(atomicCommit, /draft\.notificationLedgerBlockedReason\s*\? blockedNotificationPlan\(input\)/);
+
+  const normalFlow = source.slice(
+    source.indexOf("const nextState: WatchState ="),
+    source.indexOf("logger.flow(\"Check\", \"watch:done\""),
+  );
+  assert.match(normalFlow, /executeNotificationDelivery<WatchCheckResult>/);
+  assert.match(normalFlow, /kind: "watch-event", eventAppended: appended/);
+
+  const failureFlow = source.slice(
+    source.indexOf("private async handleFailure("),
+    source.indexOf("private async appendWatchEvent("),
+  );
+  assert.match(failureFlow, /executeNotificationDelivery<WatchCheckResult>/);
+  assert.match(failureFlow, /kind: "failure-alert", eventAppended: failureEventAppended/);
+  assert.match(failureFlow, /isDeliveredNotificationState\(notification\.state\)[\s\S]*markFailureNotificationAccepted/);
+  assert.match(failureFlow, /postNotificationStateOwnershipFailure/);
+  const escalationWrite = failureFlow.slice(
+    failureFlow.indexOf("try {"),
+    failureFlow.indexOf("const preFailureStateOwnership"),
+  );
+  assert.doesNotMatch(escalationWrite, /deliverNotification/);
+
+  const persistence = source.slice(
+    source.indexOf("private persistentDataPayload("),
+    source.indexOf("private enqueueDataOperation"),
+  );
+  assert.match(persistence, /notificationLedgerPersistenceFields\(/);
+
+  const unload = source.slice(source.indexOf("onunload(): void"), source.indexOf("async saveSettings()"));
+  assert.ok(unload.indexOf("this.unloading = true") < unload.indexOf("this.notifierClient?.dispose()"));
+  assert.match(unload, /this\.lifecycleEpoch \+= 1/);
+  const settingsSave = source.slice(source.indexOf("async saveSettings()"), source.indexOf("openCreateModal(): void"));
+  assert.ok(
+    settingsSave.indexOf("await this.persistData(lifecycleEpoch)")
+      < settingsSave.indexOf("this.startScheduler()"),
+  );
+  assert.match(settingsSave, /if \(!this\.isCurrentLifecycle\(lifecycleEpoch\)\) throw new WatchDefinitionChangedError\(\)/);
+  const settlement = source.slice(
+    source.indexOf("private async settleNotificationAttemptDurably("),
+    source.indexOf("private async markFailureNotificationAccepted("),
+  );
+  assert.match(settlement, /this\.mutatePersistentWatchState/);
+  const queuedMutation = source.slice(
+    source.indexOf("private async mutatePersistentWatchState"),
+    source.indexOf("private async persistData("),
+  );
+  assert.ok(
+    queuedMutation.indexOf("if (!this.isCurrentLifecycle(lifecycleEpoch)) throw new WatchDefinitionChangedError()")
+      < queuedMutation.indexOf("await this.saveData(this.persistentDataPayload(draft))"),
+    "late settlements must hit the unload fence before saveData",
+  );
+  assert.ok(
+    queuedMutation.lastIndexOf("if (!this.isCurrentLifecycle(lifecycleEpoch)) throw new WatchDefinitionChangedError()")
+      > queuedMutation.indexOf("await this.saveData(this.persistentDataPayload(draft))"),
+    "an active old settlement must not install its draft after saveData",
+  );
+  const settingsPersistence = source.slice(
+    source.indexOf("private async persistData("),
+    source.indexOf("}\n\nfunction inferProvider"),
+  );
+  assert.ok(
+    settingsPersistence.indexOf("if (!this.isCurrentLifecycle(lifecycleEpoch))")
+      < settingsPersistence.indexOf("await this.saveData(this.persistentDataPayload(snapshot))"),
+    "queued settings persistence must hit the lifecycle fence before saveData",
+  );
+  assert.match(source, /private startScheduler\(\): void \{\s*this\.stopScheduler\(\);\s*if \(this\.unloading\) return/);
+  assert.match(viewSource, /"legacy-accepted": "Accepted \(legacy\)"/);
+  assert.match(viewSource, /deliveryAttention[\s\S]*!isDeliveredNotificationState\(row\.latestNotification\.state\)/);
+  assert.match(viewSource, /cls: isDeliveredNotificationState\(row\.latestNotification\.state\) \? "" : "tps-watch-error"/);
 });

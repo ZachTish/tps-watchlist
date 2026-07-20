@@ -3,10 +3,11 @@ import fs from "fs";
 
 fs.mkdirSync(".test", { recursive: true });
 await esbuild.build({
-  entryPoints: ["tests/watch-core.test.ts"],
+  entryPoints: ["tests/watch-core.test.ts", "tests/notification-delivery.test.ts"],
   bundle: true,
   platform: "node",
   format: "cjs",
   target: "node18",
-  outfile: ".test/watch-core.test.cjs",
+  outdir: ".test",
+  outExtension: { ".js": ".cjs" },
 });

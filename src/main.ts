@@ -47,6 +47,24 @@ import { DEFAULT_SETTINGS, sanitizeSettings } from "./settings";
 import { WatchlistSettingTab } from "./settings-tab";
 import { WATCHLIST_VIEW_TYPE, WatchlistView } from "./view";
 import * as logger from "./logger";
+import { TPSNotifierClient } from "./tps-notifier-client";
+import type { TPSNotifierConsumerDeliveryResult } from "./tps-notifier-contract";
+import {
+  blockedNotificationPlan,
+  cloneNotificationRecordMap,
+  createNotificationRecordMap,
+  executeNotificationDelivery,
+  isDeliveredNotificationState,
+  latestNotificationForWatch,
+  loadNotificationLedger,
+  notificationLedgerPersistenceFields,
+  notificationSummary,
+  prepareNotificationDelivery,
+  settleNotificationAttempt,
+  type NotificationDeliveryPlan,
+  type NotificationSettlement,
+  type PrepareNotificationInput,
+} from "./notification-ledger";
 import type {
   CreateWatchInput,
   PersistedWatchlistData,
@@ -54,6 +72,9 @@ import type {
   WatchCondition,
   WatchDefinition,
   WatchObservation,
+  WatchNotificationKind,
+  WatchNotificationRecord,
+  WatchNotificationSummary,
   WatchProvider,
   WatchRow,
   WatchState,
@@ -101,6 +122,10 @@ interface PersistentWatchStateModel {
   transientStates: Record<string, WatchState>;
   quarantinedWatchIds: Set<string>;
   quarantinedWatchPaths: Set<string>;
+  notificationDeliveries: Record<string, WatchNotificationRecord>;
+  notificationLedgerBlockedReason: string;
+  rawNotificationLedgerVersion: unknown;
+  rawNotificationDeliveries: unknown;
 }
 
 interface PersistentStateMutation<T> {
@@ -134,6 +159,12 @@ interface StableLiveWatchDefinition {
   pendingRevision?: number;
 }
 
+interface PendingNotificationCommit {
+  eventId: string;
+  kind: WatchNotificationKind;
+  eventAppended: boolean;
+}
+
 class WatchDefinitionChangedError extends Error {}
 class WatchStatePersistenceError extends Error {}
 
@@ -143,6 +174,13 @@ export default class TPSWatchlistPlugin extends Plugin {
   private transientStates: Record<string, WatchState> = createWatchStateRecord();
   private quarantinedWatchIds = new Set<string>();
   private quarantinedWatchPaths = new Set<string>();
+  private notificationDeliveries: Record<string, WatchNotificationRecord> = createNotificationRecordMap();
+  private notificationLedgerBlockedReason = "";
+  private rawNotificationLedgerVersion: unknown;
+  private rawNotificationDeliveries: unknown;
+  private recoveredNotificationAttemptCount = 0;
+  private startupPrunedNotificationRecordCount = 0;
+  private notifierClient!: TPSNotifierClient<TFile>;
   private schedulerIntervalId: number | null = null;
   private startupTimeoutId: number | null = null;
   private batchInFlight = false;
@@ -161,6 +199,7 @@ export default class TPSWatchlistPlugin extends Plugin {
   private catalogRecoveryAttempt = 0;
   private catalogRecoveryReadFailurePaths = new Set<string>();
   private unloading = false;
+  private lifecycleEpoch = 0;
   private fileOwnerKeys = new WeakMap<TFile, string>();
   private nextFileOwnerKey = 1;
   private saveSerial: Promise<void> = Promise.resolve();
@@ -173,9 +212,15 @@ export default class TPSWatchlistPlugin extends Plugin {
   private api!: WatchlistApi;
 
   async onload(): Promise<void> {
+    const lifecycleEpoch = ++this.lifecycleEpoch;
     this.unloading = false;
-    await this.loadPluginData();
+    await this.saveSerial;
+    if (!this.isCurrentLifecycle(lifecycleEpoch)) return;
+    if (!await this.loadPluginData(lifecycleEpoch)
+      || !this.isCurrentLifecycle(lifecycleEpoch)) return;
     logger.setLogging(this.settings.enableLogging);
+    this.notifierClient = new TPSNotifierClient<TFile>(this.app, this.manifest.id);
+    this.notifierClient.start((eventRef) => this.registerEvent(eventRef));
     this.registerView(WATCHLIST_VIEW_TYPE, (leaf) => new WatchlistView(leaf, this));
     this.registerCommands();
     this.addRibbonIcon("binoculars", "Open TPS Watchlist", () => {
@@ -221,13 +266,19 @@ export default class TPSWatchlistPlugin extends Plugin {
       transientStateCount: Object.keys(this.transientStates).length,
       quarantinedIdentityCount: this.quarantinedWatchIds.size,
       quarantinedPathCount: this.quarantinedWatchPaths.size,
+      notificationRecordCount: Object.keys(this.notificationDeliveries).length,
+      notificationLedgerBlocked: Boolean(this.notificationLedgerBlockedReason),
+      recoveredNotificationAttemptCount: this.recoveredNotificationAttemptCount,
+      startupPrunedNotificationRecordCount: this.startupPrunedNotificationRecordCount,
     });
   }
 
   onunload(): void {
     this.unloading = true;
+    this.lifecycleEpoch += 1;
     this.stopCatalogRecovery();
     this.stopScheduler();
+    this.notifierClient?.dispose();
     for (const unregister of this.unregisterGcmActions.splice(0)) unregister();
     for (const unregister of this.unregisterAiCapabilities.splice(0)) unregister();
     this.app.workspace.detachLeavesOfType(WATCHLIST_VIEW_TYPE);
@@ -237,10 +288,13 @@ export default class TPSWatchlistPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
+    const lifecycleEpoch = this.lifecycleEpoch;
+    if (!this.isCurrentLifecycle(lifecycleEpoch)) throw new WatchDefinitionChangedError();
     this.settings = sanitizeSettings(this.settings);
     this.invalidateWatchCatalog();
     logger.setLogging(this.settings.enableLogging);
-    await this.persistData();
+    await this.persistData(lifecycleEpoch);
+    if (!this.isCurrentLifecycle(lifecycleEpoch)) throw new WatchDefinitionChangedError();
     this.startScheduler();
     logger.flow("Settings", "saved", {
       executionMode: this.settings.executionMode,
@@ -350,8 +404,13 @@ export default class TPSWatchlistPlugin extends Plugin {
           identityNotice: !blocked && !stateTrusted
             ? "Identity was previously duplicated; the next successful check will establish a new silent baseline."
             : undefined,
+          latestNotification: latestNotificationForWatch(this.notificationDeliveries, definition.id),
         };
       });
+  }
+
+  getNotificationLedgerWarning(): string {
+    return this.notificationLedgerBlockedReason;
   }
 
   private scanWatchDefinitions(): WatchDefinition[] {
@@ -1024,6 +1083,7 @@ export default class TPSWatchlistPlugin extends Plugin {
 
   private startScheduler(): void {
     this.stopScheduler();
+    if (this.unloading) return;
     const intervalMs = Math.max(30000, this.settings.schedulerTickSeconds * 1000);
     this.startupTimeoutId = window.setTimeout(() => {
       this.startupTimeoutId = null;
@@ -1395,7 +1455,7 @@ export default class TPSWatchlistPlugin extends Plugin {
           return this.withEffectJournal(postEventOwnershipFailure, effects);
         }
       }
-      await this.commitWatchStateDurably(definition, {
+      const nextState: WatchState = {
         ...previous,
         fingerprintVersion: WATCH_FINGERPRINT_VERSION,
         baselineReady: true,
@@ -1408,33 +1468,83 @@ export default class TPSWatchlistPlugin extends Plugin {
         failureCount: 0,
         lastError: "",
         lastErrorNotifiedAt: "",
-      }, prepared.migration, !identityLease.conflicted);
-      recordWatchCommittedEffect(effects);
-      const postPersistOwnershipFailure = await this.identityOwnershipFailure(
-        prepared,
-        identityLease,
-        reason,
-        true,
-        true,
-      );
-      if (postPersistOwnershipFailure) {
-        return this.withEffectJournal(postPersistOwnershipFailure, effects);
-      }
+      };
+      let notification: WatchNotificationSummary | undefined;
       if (eventPresent && definition.notify) {
-        await this.deliverNotification(
-          "Watch triggered: " + definition.title,
-          eventSummary(evaluation.eventKind, observation.displayValue, previous.lastValue),
-          definition.path,
+        let postPersistOwnershipFailure: WatchCheckResult | null = null;
+        let postNotificationOwnershipFailure: WatchCheckResult | null = null;
+        const execution = await executeNotificationDelivery<WatchCheckResult>({
+          prepare: async () => {
+            const plan = await this.commitWatchStateAndPrepareNotification(
+              definition,
+              nextState,
+              prepared!.migration,
+              !identityLease!.conflicted,
+              { eventId, kind: "watch-event", eventAppended: appended },
+            );
+            recordWatchCommittedEffect(effects);
+            return plan;
+          },
+          revalidateBeforeSend: async () => {
+            postPersistOwnershipFailure = await this.identityOwnershipFailure(
+              prepared!,
+              identityLease,
+              reason,
+              true,
+              true,
+            );
+            return postPersistOwnershipFailure;
+          },
+          send: async () => await this.deliverNotification(
+            "Watch triggered: " + definition.title,
+            eventSummary(evaluation.eventKind, observation.displayValue, previous.lastValue),
+            definition.path,
+          ),
+          settle: async (attemptId, settlement) => await this.settleNotificationAttemptDurably(
+            eventId,
+            attemptId,
+            settlement,
+          ),
+          revalidateAfterSend: async () => {
+            postNotificationOwnershipFailure = await this.identityOwnershipFailure(
+              prepared!,
+              identityLease,
+              reason,
+              true,
+              true,
+            );
+            return postNotificationOwnershipFailure;
+          },
+        });
+        notification = execution.notification;
+        if (execution.settlementError) {
+          logger.failure(
+            "Notification",
+            "ledger:settlement-persist-failed",
+            new Error(sanitizeWatchErrorMessage(execution.settlementError)),
+            { watchPath: definition.path, eventId },
+          );
+        }
+        if (execution.conflict) {
+          return this.withEffectJournal({ ...execution.conflict, notification }, effects);
+        }
+      } else {
+        await this.commitWatchStateDurably(
+          definition,
+          nextState,
+          prepared.migration,
+          !identityLease.conflicted,
         );
-        const postNotificationOwnershipFailure = await this.identityOwnershipFailure(
+        recordWatchCommittedEffect(effects);
+        const postPersistOwnershipFailure = await this.identityOwnershipFailure(
           prepared,
           identityLease,
           reason,
           true,
           true,
         );
-        if (postNotificationOwnershipFailure) {
-          return this.withEffectJournal(postNotificationOwnershipFailure, effects);
+        if (postPersistOwnershipFailure) {
+          return this.withEffectJournal(postPersistOwnershipFailure, effects);
         }
       }
       logger.flow("Check", "watch:done", {
@@ -1451,6 +1561,7 @@ export default class TPSWatchlistPlugin extends Plugin {
         outcome,
         eventId: appended ? eventId : undefined,
         attempted: true,
+        notification,
       }, effects);
     } catch (error) {
       if (error instanceof WatchDefinitionChangedError) {
@@ -1859,6 +1970,97 @@ export default class TPSWatchlistPlugin extends Plugin {
     }
   }
 
+  private async commitWatchStateAndPrepareNotification(
+    definition: WatchDefinition,
+    state: WatchState,
+    migration: WatchStateMigrationPlan,
+    establishTrustedBaseline: boolean,
+    notification: PendingNotificationCommit,
+  ): Promise<NotificationDeliveryPlan> {
+    const durableIds = new Set(this.getIdentitySnapshot().durableIds);
+    const input: PrepareNotificationInput = {
+      eventId: notification.eventId,
+      watchId: definition.id,
+      kind: notification.kind,
+      eventAppended: notification.eventAppended,
+      attemptId: createLocalId("notification-attempt"),
+      now: new Date().toISOString(),
+    };
+    try {
+      const plan = await this.mutatePersistentWatchState((draft) => {
+        this.applyWatchStateCommitToModel(
+          draft,
+          definition,
+          { ...state },
+          migration,
+          establishTrustedBaseline,
+          durableIds,
+        );
+        const prepared = draft.notificationLedgerBlockedReason
+          ? blockedNotificationPlan(input)
+          : prepareNotificationDelivery(draft.notificationDeliveries, input);
+        return { changed: true, value: prepared };
+      });
+      if (plan.prunedEventIds.length) {
+        logger.flow("Notification", "ledger:pruned", { count: plan.prunedEventIds.length });
+      }
+      if (this.notificationLedgerBlockedReason) {
+        logger.warn("Notification", "ledger:blocked", {
+          watchPath: definition.path,
+          eventId: notification.eventId,
+          reason: this.notificationLedgerBlockedReason,
+        });
+      }
+      return plan;
+    } catch (error) {
+      if (error instanceof WatchDefinitionChangedError) throw error;
+      throw new WatchStatePersistenceError(sanitizeWatchErrorMessage(error));
+    }
+  }
+
+  private async settleNotificationAttemptDurably(
+    eventId: string,
+    attemptId: string,
+    settlement: NotificationSettlement,
+  ): Promise<WatchNotificationSummary> {
+    return await this.mutatePersistentWatchState((draft) => {
+      if (draft.notificationLedgerBlockedReason) {
+        throw new Error("Notification ledger is blocked and cannot accept delivery results.");
+      }
+      const result = settleNotificationAttempt(
+        draft.notificationDeliveries,
+        eventId,
+        attemptId,
+        settlement,
+        new Date().toISOString(),
+      );
+      if (!result.record) throw new Error("The notification attempt record is missing.");
+      return {
+        changed: result.changed,
+        value: notificationSummary(result.record),
+      };
+    });
+  }
+
+  private async markFailureNotificationAccepted(
+    definition: WatchDefinition,
+    expectedState: WatchState,
+    acceptedAt: string,
+  ): Promise<void> {
+    await this.mutatePersistentWatchState((draft) => {
+      const current = draft.states[definition.id];
+      if (!current
+        || current.lastCheckedAt !== expectedState.lastCheckedAt
+        || current.failureCount !== expectedState.failureCount
+        || current.lastError !== expectedState.lastError
+        || current.lastErrorNotifiedAt === acceptedAt) {
+        return { changed: false, value: undefined };
+      }
+      draft.states[definition.id] = { ...current, lastErrorNotifiedAt: acceptedAt };
+      return { changed: true, value: undefined };
+    });
+  }
+
   private async ensureQuarantinePersisted(): Promise<void> {
     await this.quarantinePersistBarrier;
     if (!this.pendingQuarantineIds.size
@@ -1896,10 +2098,12 @@ export default class TPSWatchlistPlugin extends Plugin {
     const summary = truncate(sanitizeWatchErrorMessage(error), 240);
     const failureCount = previous.failureCount + 1;
     const failedAt = new Date().toISOString();
-    let lastErrorNotifiedAt = previous.lastErrorNotifiedAt;
     let failureEscalationFailed = false;
     let failureEventId = "";
     let failureEventAppended = false;
+    let failureEventPresent = false;
+    let notification: WatchNotificationSummary | undefined;
+    let notificationPersistenceFailure = "";
     logger.failure("Check", "watch:failed", new Error(summary), {
       reason,
       path: definition.path,
@@ -1942,6 +2146,7 @@ export default class TPSWatchlistPlugin extends Plugin {
           effects,
         );
         failureEventAppended = eventWrite.appended;
+        failureEventPresent = true;
         await this.trustExactCatalogMutation(prepared, eventWrite);
         const postEventOwnershipFailure = await this.identityOwnershipFailure(
           prepared,
@@ -1952,24 +2157,6 @@ export default class TPSWatchlistPlugin extends Plugin {
         );
         if (postEventOwnershipFailure) {
           return this.withEffectJournal(postEventOwnershipFailure, effects);
-        }
-        if (failureEventAppended && this.settings.notifyOnFailure && definition.notify) {
-          await this.deliverNotification(
-            "Watch needs attention: " + definition.title,
-            summary,
-            definition.path,
-          );
-          lastErrorNotifiedAt = failedAt;
-          const postNotificationOwnershipFailure = await this.identityOwnershipFailure(
-            prepared,
-            identityLease,
-            reason,
-            providerAttempted,
-            effects.committed,
-          );
-          if (postNotificationOwnershipFailure) {
-            return this.withEffectJournal(postNotificationOwnershipFailure, effects);
-          }
         }
       }
     } catch (escalationError) {
@@ -1996,14 +2183,115 @@ export default class TPSWatchlistPlugin extends Plugin {
 
     let persistenceFailure = "";
     try {
-      await this.commitWatchStateDurably(definition, {
+      const nextFailureState: WatchState = {
         ...previous,
         lastCheckedAt: failedAt,
         failureCount: failureEscalationFailed ? previous.failureCount : failureCount,
         lastError: summary,
-        lastErrorNotifiedAt,
-      }, migration, false);
-      recordWatchCommittedEffect(effects);
+        lastErrorNotifiedAt: previous.lastErrorNotifiedAt,
+      };
+      if (failureEventPresent && this.settings.notifyOnFailure && definition.notify) {
+        let postFailureStateOwnership: WatchCheckResult | null = null;
+        let postNotificationOwnershipFailure: WatchCheckResult | null = null;
+        const execution = await executeNotificationDelivery<WatchCheckResult>({
+          prepare: async () => {
+            const plan = await this.commitWatchStateAndPrepareNotification(
+              definition,
+              nextFailureState,
+              migration,
+              false,
+              { eventId: failureEventId, kind: "failure-alert", eventAppended: failureEventAppended },
+            );
+            recordWatchCommittedEffect(effects);
+            return plan;
+          },
+          revalidateBeforeSend: async () => {
+            postFailureStateOwnership = await this.identityOwnershipFailure(
+              prepared,
+              identityLease,
+              reason,
+              providerAttempted,
+              effects.committed,
+            );
+            return postFailureStateOwnership;
+          },
+          send: async () => await this.deliverNotification(
+            "Watch needs attention: " + definition.title,
+            summary,
+            definition.path,
+          ),
+          settle: async (attemptId, settlement) => await this.settleNotificationAttemptDurably(
+            failureEventId,
+            attemptId,
+            settlement,
+          ),
+          revalidateAfterSend: async () => {
+            postNotificationOwnershipFailure = await this.identityOwnershipFailure(
+              prepared,
+              identityLease,
+              reason,
+              providerAttempted,
+              effects.committed,
+            );
+            return postNotificationOwnershipFailure;
+          },
+        });
+        notification = execution.notification;
+        if (execution.settlementError) {
+          notificationPersistenceFailure = truncate(
+            sanitizeWatchErrorMessage(execution.settlementError),
+            180,
+          );
+          logger.failure(
+            "Notification",
+            "ledger:settlement-persist-failed",
+            new Error(notificationPersistenceFailure),
+            { watchPath: definition.path, eventId: failureEventId },
+          );
+        }
+        if (execution.conflict) {
+          return this.withEffectJournal({ ...execution.conflict, notification }, effects);
+        }
+        if (isDeliveredNotificationState(notification.state)) {
+          try {
+            await this.markFailureNotificationAccepted(
+              definition,
+              nextFailureState,
+              notification.updatedAt,
+            );
+          } catch (acceptedStateError) {
+            logger.failure(
+              "Notification",
+              "failure-accepted-state:persist-failed",
+              new Error(sanitizeWatchErrorMessage(acceptedStateError)),
+              { watchPath: definition.path, eventId: failureEventId },
+            );
+          }
+          const postNotificationStateOwnershipFailure = await this.identityOwnershipFailure(
+            prepared,
+            identityLease,
+            reason,
+            providerAttempted,
+            effects.committed,
+          );
+          if (postNotificationStateOwnershipFailure) {
+            return this.withEffectJournal({ ...postNotificationStateOwnershipFailure, notification }, effects);
+          }
+        }
+      } else {
+        await this.commitWatchStateDurably(definition, nextFailureState, migration, false);
+        recordWatchCommittedEffect(effects);
+        const postFailureStateOwnership = await this.identityOwnershipFailure(
+          prepared,
+          identityLease,
+          reason,
+          providerAttempted,
+          effects.committed,
+        );
+        if (postFailureStateOwnership) {
+          return this.withEffectJournal(postFailureStateOwnership, effects);
+        }
+      }
     } catch (persistError) {
       persistenceFailure = truncate(sanitizeWatchErrorMessage(persistError), 180);
       logger.failure("Check", "failure-state:persist-failed", new Error(persistenceFailure), {
@@ -2012,16 +2300,6 @@ export default class TPSWatchlistPlugin extends Plugin {
         provider: definition.provider,
         failureCount,
       });
-    }
-    const postFailureStateOwnership = await this.identityOwnershipFailure(
-      prepared,
-      identityLease,
-      reason,
-      providerAttempted,
-      effects.committed,
-    );
-    if (postFailureStateOwnership) {
-      return this.withEffectJournal(postFailureStateOwnership, effects);
     }
     try {
       await this.refreshViews();
@@ -2039,10 +2317,13 @@ export default class TPSWatchlistPlugin extends Plugin {
       outcome: "failed",
       error: persistenceFailure
         ? summary + " Failure health was not persisted: " + persistenceFailure
+        : notificationPersistenceFailure
+          ? summary + " Notification accounting remains unresolved: " + notificationPersistenceFailure
         : summary,
       code: persistenceFailure ? "state-persistence-failed" : undefined,
       attempted: providerAttempted,
       eventId: failureEventAppended ? failureEventId : undefined,
+      notification,
     }, effects);
   }
 
@@ -2135,27 +2416,36 @@ export default class TPSWatchlistPlugin extends Plugin {
     }
   }
 
-  private async deliverNotification(title: string, body: string, watchPath: string): Promise<void> {
+  private async deliverNotification(
+    title: string,
+    body: string,
+    watchPath: string,
+  ): Promise<TPSNotifierConsumerDeliveryResult> {
     const file = this.app.vault.getAbstractFileByPath(watchPath);
-    const notifier = this.getNotifierApi();
     logger.flow("Notification", "send:start", {
-      title,
       watchPath,
-      route: typeof notifier?.sendNotification === "function" ? "tps-notifier" : "obsidian-notice",
+      route: "tps-notifier-client",
     });
-    if (typeof notifier?.sendNotification === "function") {
+    const result = await this.notifierClient.send({
+      title,
+      body,
+      file: file instanceof TFile ? file : undefined,
+    });
+    if (result.state === "not-attempted" && result.attempted === false) {
       try {
-        await notifier.sendNotification(title, body, file instanceof TFile ? file : undefined);
-        logger.flow("Notification", "send:done", { watchPath });
-        return;
+        new Notice(title + "\n" + body, 10000);
       } catch (error) {
-        const summary = sanitizeWatchErrorMessage(error);
-        logger.failure("Notification", "send:failed", new Error(summary), { watchPath });
-        throw new Error("Notification delivery failed; no ambiguous fallback was attempted: " + summary);
+        logger.failure("Notification", "local-notice:failed", error, { watchPath });
       }
     }
-    new Notice(title + "\n" + body, 10000);
-    logger.flow("Notification", "send:done", { watchPath });
+    logger.flow("Notification", "send:classified", {
+      watchPath,
+      state: result.state,
+      transport: result.transport,
+      evidence: result.evidence,
+      attempted: result.attempted,
+    });
+    return result;
   }
 
   private definitionFromFile(file: TFile): WatchDefinition | null {
@@ -2542,10 +2832,6 @@ export default class TPSWatchlistPlugin extends Plugin {
     return (this.app as any)?.plugins?.getPlugin?.("tps-controller")?.api || null;
   }
 
-  private getNotifierApi(): any {
-    return (this.app as any)?.plugins?.getPlugin?.("tps-messager")?.api || null;
-  }
-
   private getAiGatewayApi(): any {
     return (this.app as any).tpsAiGateway
       || (this.app as any)?.plugins?.getPlugin?.("tps-ai-gateway")?.api
@@ -2571,8 +2857,9 @@ export default class TPSWatchlistPlugin extends Plugin {
     }
   }
 
-  private async loadPluginData(): Promise<void> {
+  private async loadPluginData(lifecycleEpoch: number): Promise<boolean> {
     const raw = await this.loadData() as Partial<PersistedWatchlistData> | null;
+    if (!this.isCurrentLifecycle(lifecycleEpoch)) return false;
     this.settings = sanitizeSettings(raw?.settings || raw || {});
     this.states = createWatchStateRecord();
     const states = raw?.states && typeof raw.states === "object" ? raw.states : {};
@@ -2597,6 +2884,31 @@ export default class TPSWatchlistPlugin extends Plugin {
     if (raw?.identityStateVersion !== WATCH_IDENTITY_STATE_VERSION) {
       for (const id of this.quarantinedWatchIds) this.states[id] = createEmptyState();
     }
+    const ledger = loadNotificationLedger(raw, new Date().toISOString());
+    this.notificationDeliveries = ledger.records;
+    this.notificationLedgerBlockedReason = ledger.blockedReason || "";
+    this.rawNotificationLedgerVersion = ledger.rawVersion;
+    this.rawNotificationDeliveries = ledger.rawDeliveries;
+    this.recoveredNotificationAttemptCount = ledger.recoveredAttemptCount;
+    this.startupPrunedNotificationRecordCount = ledger.prunedRecordCount;
+    if (ledger.recoveredAttemptCount > 0 || ledger.prunedRecordCount > 0) {
+      if (!this.isCurrentLifecycle(lifecycleEpoch)) return false;
+      try {
+        await this.enqueueDataOperation(async () => {
+          if (!this.isCurrentLifecycle(lifecycleEpoch)) throw new WatchDefinitionChangedError();
+          const payload = this.persistentDataPayload(this.clonePersistentWatchState());
+          await this.saveData(payload);
+          if (!this.isCurrentLifecycle(lifecycleEpoch)) throw new WatchDefinitionChangedError();
+        });
+      } catch (error) {
+        if (!this.isCurrentLifecycle(lifecycleEpoch)) return false;
+        this.notificationDeliveries = createNotificationRecordMap();
+        this.notificationLedgerBlockedReason = "Notification ledger startup recovery could not be persisted durably: "
+          + truncate(sanitizeWatchErrorMessage(error), 180);
+      }
+      if (!this.isCurrentLifecycle(lifecycleEpoch)) return false;
+    }
+    return true;
   }
 
   private clonePersistentWatchState(): PersistentWatchStateModel {
@@ -2605,6 +2917,10 @@ export default class TPSWatchlistPlugin extends Plugin {
       transientStates: cloneWatchStateRecord(this.transientStates),
       quarantinedWatchIds: new Set(this.quarantinedWatchIds),
       quarantinedWatchPaths: new Set(this.quarantinedWatchPaths),
+      notificationDeliveries: cloneNotificationRecordMap(this.notificationDeliveries),
+      notificationLedgerBlockedReason: this.notificationLedgerBlockedReason,
+      rawNotificationLedgerVersion: this.rawNotificationLedgerVersion,
+      rawNotificationDeliveries: this.rawNotificationDeliveries,
     };
   }
 
@@ -2613,9 +2929,19 @@ export default class TPSWatchlistPlugin extends Plugin {
     this.transientStates = model.transientStates;
     this.quarantinedWatchIds = model.quarantinedWatchIds;
     this.quarantinedWatchPaths = model.quarantinedWatchPaths;
+    this.notificationDeliveries = model.notificationDeliveries;
+    this.notificationLedgerBlockedReason = model.notificationLedgerBlockedReason;
+    this.rawNotificationLedgerVersion = model.rawNotificationLedgerVersion;
+    this.rawNotificationDeliveries = model.rawNotificationDeliveries;
   }
 
   private persistentDataPayload(model: PersistentWatchStateModel): PersistedWatchlistData {
+    const notificationData = notificationLedgerPersistenceFields(
+      Boolean(model.notificationLedgerBlockedReason),
+      model.notificationDeliveries,
+      model.rawNotificationLedgerVersion,
+      model.rawNotificationDeliveries,
+    );
     return {
       settings: { ...this.settings },
       states: cloneWatchStateRecord(model.states),
@@ -2623,6 +2949,7 @@ export default class TPSWatchlistPlugin extends Plugin {
       quarantinedWatchIds: Array.from(model.quarantinedWatchIds).sort((left, right) => left.localeCompare(right)),
       quarantinedWatchPaths: Array.from(model.quarantinedWatchPaths).sort((left, right) => left.localeCompare(right)),
       identityStateVersion: WATCH_IDENTITY_STATE_VERSION,
+      ...notificationData,
     };
   }
 
@@ -2632,24 +2959,32 @@ export default class TPSWatchlistPlugin extends Plugin {
     return run;
   }
 
+  private isCurrentLifecycle(lifecycleEpoch: number): boolean {
+    return !this.unloading && lifecycleEpoch === this.lifecycleEpoch;
+  }
+
   private async mutatePersistentWatchState<T>(
     mutate: (draft: PersistentWatchStateModel) => PersistentStateMutation<T>,
   ): Promise<T> {
+    const lifecycleEpoch = this.lifecycleEpoch;
     return await this.enqueueDataOperation(async () => {
-      if (this.unloading) throw new WatchDefinitionChangedError();
+      if (!this.isCurrentLifecycle(lifecycleEpoch)) throw new WatchDefinitionChangedError();
       const draft = this.clonePersistentWatchState();
       const result = mutate(draft);
       if (!result.changed) return result.value;
       await this.saveData(this.persistentDataPayload(draft));
+      if (!this.isCurrentLifecycle(lifecycleEpoch)) throw new WatchDefinitionChangedError();
       this.installPersistentWatchState(draft);
       return result.value;
     });
   }
 
-  private async persistData(): Promise<void> {
+  private async persistData(lifecycleEpoch: number): Promise<void> {
     await this.enqueueDataOperation(async () => {
+      if (!this.isCurrentLifecycle(lifecycleEpoch)) throw new WatchDefinitionChangedError();
       const snapshot = this.clonePersistentWatchState();
       await this.saveData(this.persistentDataPayload(snapshot));
+      if (!this.isCurrentLifecycle(lifecycleEpoch)) throw new WatchDefinitionChangedError();
     });
   }
 }
