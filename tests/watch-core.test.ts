@@ -15,6 +15,7 @@ import {
   stableHash,
   WATCH_FINGERPRINT_VERSION,
 } from "../src/core";
+import { WatchlistPersistenceCoordinator } from "../src/persistence";
 import type { WatchDefinition, WatchObservation } from "../src/types";
 
 const definition = (overrides: Partial<WatchDefinition> = {}): WatchDefinition => ({
@@ -143,6 +144,123 @@ test("single-flight joins concurrent checks by key and clears after completion",
   assert.equal(inFlight.size, 0);
 });
 
+test("state-only persistence reloads and preserves synchronized settings and unknown data", async () => {
+  let disk: Record<string, unknown> = {
+    settings: { settingA: "loaded", settingB: "loaded", futureSetting: { enabled: true } },
+    states: { diskWatch: { lastValue: "old" } },
+    futureTopLevel: { version: 2 },
+  };
+  let writes = 0;
+  const persistence = new WatchlistPersistenceCoordinator(
+    async () => structuredClone(disk),
+    async (data) => {
+      writes += 1;
+      disk = structuredClone(data);
+    },
+  );
+  persistence.setSettingsBaseline({ settingA: "loaded", settingB: "loaded" });
+
+  // Simulate another synchronized device changing setting A after plugin load.
+  disk = {
+    ...disk,
+    settings: { settingA: "synchronized", settingB: "synchronized", futureSetting: { enabled: true } },
+  };
+  await persistence.saveStates({ localWatch: { lastValue: "new" } });
+  assert.deepEqual(disk, {
+    settings: { settingA: "synchronized", settingB: "synchronized", futureSetting: { enabled: true } },
+    states: { localWatch: { lastValue: "new" } },
+    futureTopLevel: { version: 2 },
+  });
+
+  // A settings write owns settings, but not newer state or unknown top-level data.
+  disk = {
+    ...disk,
+    states: { synchronizedWatch: { lastValue: "newest" } },
+    anotherFutureField: ["keep"],
+  };
+  await persistence.saveSettings({ settingA: "local-save", settingB: "loaded" });
+  assert.deepEqual(disk, {
+    settings: { settingA: "local-save", settingB: "synchronized", futureSetting: { enabled: true } },
+    states: { synchronizedWatch: { lastValue: "newest" } },
+    futureTopLevel: { version: 2 },
+    anotherFutureField: ["keep"],
+  });
+  assert.equal(writes, 2);
+});
+
+test("overlapping Watchlist settings writes retain an in-flight revert", async () => {
+  let disk: Record<string, unknown> = { settings: { settingA: "old", futureSetting: true }, states: {} };
+  let releaseFirstWrite!: () => void;
+  const firstWriteGate = new Promise<void>((resolve) => { releaseFirstWrite = resolve; });
+  let markFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+  let writeCount = 0;
+  const persistence = new WatchlistPersistenceCoordinator(
+    async () => structuredClone(disk),
+    async (data) => {
+      writeCount += 1;
+      if (writeCount === 1) {
+        markFirstStarted();
+        await firstWriteGate;
+      }
+      disk = structuredClone(data);
+    },
+  );
+  persistence.setSettingsBaseline({ settingA: "old" });
+
+  const first = persistence.saveSettings({ settingA: "new" });
+  await firstStarted;
+  const reverted = persistence.saveSettings({ settingA: "old" });
+  releaseFirstWrite();
+  await Promise.all([first, reverted]);
+
+  assert.equal(writeCount, 2);
+  assert.deepEqual(disk, { settings: { settingA: "old", futureSetting: true }, states: {} });
+});
+
+test("a failed Watchlist write does not strand a queued newer setting", async () => {
+  let disk: Record<string, unknown> = { settings: { settingA: "old" }, states: {} };
+  let releaseFailure!: () => void;
+  const failureGate = new Promise<void>((resolve) => { releaseFailure = resolve; });
+  let markFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+  let attempts = 0;
+  const persistence = new WatchlistPersistenceCoordinator(
+    async () => structuredClone(disk),
+    async (data) => {
+      attempts += 1;
+      if (attempts === 1) {
+        markFirstStarted();
+        await failureGate;
+        throw new Error("first write failed");
+      }
+      disk = structuredClone(data);
+    },
+  );
+  persistence.setSettingsBaseline({ settingA: "old" });
+
+  const failed = persistence.saveSettings({ settingA: "first" });
+  await firstStarted;
+  const newest = persistence.saveSettings({ settingA: "newest" });
+  releaseFailure();
+  await assert.rejects(failed, /first write failed/);
+  await newest;
+
+  assert.equal(attempts, 2);
+  assert.deepEqual(disk, { settings: { settingA: "newest" }, states: {} });
+});
+
+test("persistence fails closed when current plugin data cannot be loaded", async () => {
+  let writes = 0;
+  const persistence = new WatchlistPersistenceCoordinator(
+    async () => { throw new Error("load failed"); },
+    async () => { writes += 1; },
+  );
+  await assert.rejects(() => persistence.saveStates({ localWatch: {} }), /load failed/);
+  await assert.rejects(() => persistence.saveSettings({ settingA: "local" }), /load failed/);
+  assert.equal(writes, 0);
+});
+
 test("RSS new-item fingerprints stable source identity rather than mutable item text", () => {
   const first = observationFingerprint("new-item", "Original title and summary", "guid-1");
   const edited = observationFingerprint("new-item", "Corrected title and summary", "guid-1");
@@ -196,4 +314,11 @@ test("Watchlist isolates failed checks and secondary failure bookkeeping", () =>
   assert.match(source, /"failure-state:persist-failed"/);
   assert.match(source, /"failure-state:view-refresh-failed"/);
   assert.match(source, /stateMigrated/);
+});
+
+test("Watchlist routes settings and runtime-state persistence through separate merge paths", () => {
+  const source = readFileSync("src/main.ts", "utf8");
+  assert.match(source, /persistence\.saveSettings\(this\.settings\)/);
+  assert.match(source, /persistence\.saveStates\(this\.states\)/);
+  assert.doesNotMatch(source, /saveData\(\{ settings: this\.settings, states: this\.states \}\)/);
 });

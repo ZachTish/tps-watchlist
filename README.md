@@ -1,5 +1,11 @@
 # TPS Watchlist
 
+## 0.1.2
+
+- Runtime watch-state writes and user settings writes remain separate and now both reload the newest plugin data before saving. State updates preserve settings; settings updates preserve states, synchronized unrelated choices, and unknown fields.
+- Overlapping settings edits retain quick reverts, and a queued newer write is not stranded by an earlier failure.
+- This backward-compatible patch keeps the minimum supported Obsidian version at 1.10.0 and requires no manual migration.
+
 ## Development and deployment
 
 Canonical source, tests, Git metadata, and dependencies live in `/Users/zachtisherman/TishOS Plugin Development/TPS-Watchlist (Dev)`, outside both vaults. `npm run build` and watch builds deploy byte-changed runtime artifacts by default only to `/Users/zachtisherman/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Plugin Test Vault/.obsidian/plugins/tps-watchlist`; `npm test` is therefore isolated even though it ends with a production-mode build. Promotion to `/Users/zachtisherman/TishOS v0.1/.obsidian/plugins/tps-watchlist` is an explicit guarded post-validation action. Neither target overwrites `data.json` or other runtime-owned state.
@@ -8,7 +14,7 @@ Canonical source, tests, Git metadata, and dependencies live in `/Users/zachtish
 
 ## Install with BRAT
 
-Add the private repository `ZachTish/tps-watchlist` to BRAT and select **Latest** tracking so BRAT follows the newest GitHub release. For private-repository access, give BRAT a fine-grained GitHub token scoped to this repository with **Contents: Read-only** permission. Never commit the token to this repository, an Obsidian vault, or any synced note.
+Add the public repository `ZachTish/tps-watchlist` to BRAT and select **Latest** so BRAT follows numbered releases without a private-repository token. Freeze a numeric version when a device should remain pinned.
 
 TPS Watchlist is the contract-native monitoring domain for products, prices, availability, releases, feeds, market data endpoints, industry news, and other external changes.
 
@@ -25,6 +31,7 @@ The plugin treats a watch as a durable entity note, an observation as derived st
 - Daily notes own events by default.
 - Event lines remain human-readable and keep machine fields in a compact HTML comment.
 - Baselines, fingerprints, current values, check health, cooldown state, and notification dedupe state live in plugin `data.json`.
+- Settings saves and watch-state saves use separate serialized merge paths. State-only writes first reload `data.json` and preserve synchronized settings and unknown fields; settings writes preserve the newest states and unknown top-level data. A failed reload aborts the write.
 - Provider response bodies are never persisted.
 - Tasks are created only through an explicit follow-up workflow; watch events are not checkboxes.
 

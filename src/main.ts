@@ -22,6 +22,7 @@ import {
 } from "./core";
 import { fetchWatchObservation } from "./providers";
 import { CreateWatchModal } from "./modal";
+import { WatchlistPersistenceCoordinator } from "./persistence";
 import { DEFAULT_SETTINGS, sanitizeSettings } from "./settings";
 import { WatchlistSettingTab } from "./settings-tab";
 import { WATCHLIST_VIEW_TYPE, WatchlistView } from "./view";
@@ -59,13 +60,18 @@ export default class TPSWatchlistPlugin extends Plugin {
   private startupTimeoutId: number | null = null;
   private batchInFlight = false;
   private checksInFlight = new Map<string, Promise<WatchCheckResult>>();
-  private saveSerial: Promise<void> = Promise.resolve();
+  private persistence: WatchlistPersistenceCoordinator<WatchlistSettings, Record<string, WatchState>> | null = null;
   private unregisterGcmActions: Array<() => void> = [];
   private unregisterAiCapabilities: Array<() => void> = [];
   private api!: WatchlistApi;
 
   async onload(): Promise<void> {
+    this.persistence = new WatchlistPersistenceCoordinator(
+      () => this.loadData(),
+      (data) => this.saveData(data),
+    );
     await this.loadPluginData();
+    this.persistence.setSettingsBaseline(this.settings);
     logger.setLogging(this.settings.enableLogging);
     this.registerView(WATCHLIST_VIEW_TYPE, (leaf) => new WatchlistView(leaf, this));
     this.registerCommands();
@@ -106,7 +112,8 @@ export default class TPSWatchlistPlugin extends Plugin {
   async saveSettings(): Promise<void> {
     this.settings = sanitizeSettings(this.settings);
     logger.setLogging(this.settings.enableLogging);
-    await this.persistData();
+    if (!this.persistence) throw new Error("TPS Watchlist persistence is not ready.");
+    await this.persistence.saveSettings(this.settings);
     this.startScheduler();
     logger.flow("Settings", "saved", {
       executionMode: this.settings.executionMode,
@@ -441,7 +448,7 @@ export default class TPSWatchlistPlugin extends Plugin {
       );
       await Promise.all(workers);
       try {
-        await this.persistData();
+        await this.persistStates();
       } catch (error) {
         logger.failure("Check", "batch:persist-failed", new Error(sanitizeWatchErrorMessage(error)), {
           reason,
@@ -556,7 +563,7 @@ export default class TPSWatchlistPlugin extends Plugin {
         lastError: "",
         lastErrorNotifiedAt: "",
       };
-      await this.persistData();
+      await this.persistStates();
       logger.flow("Check", "watch:done", {
         reason,
         path: definition.path,
@@ -636,7 +643,7 @@ export default class TPSWatchlistPlugin extends Plugin {
       lastErrorNotifiedAt,
     };
     try {
-      await this.persistData();
+      await this.persistStates();
     } catch (persistError) {
       logger.failure("Check", "failure-state:persist-failed", new Error(sanitizeWatchErrorMessage(persistError)), {
         reason,
@@ -1051,11 +1058,9 @@ export default class TPSWatchlistPlugin extends Plugin {
     for (const [key, value] of Object.entries(states)) this.states[key] = sanitizeState(value);
   }
 
-  private async persistData(): Promise<void> {
-    this.saveSerial = this.saveSerial
-      .catch(() => undefined)
-      .then(() => this.saveData({ settings: this.settings, states: this.states }));
-    await this.saveSerial;
+  private async persistStates(): Promise<void> {
+    if (!this.persistence) throw new Error("TPS Watchlist persistence is not ready.");
+    await this.persistence.saveStates(this.states);
   }
 }
 
