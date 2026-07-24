@@ -190,23 +190,197 @@
   margin-top: 18px;
 }
 
-.tps-watch-settings-section {
+.tps-watch-settings-shortcuts,
+.tps-watch-settings-shortcuts-actions {
+  display: flex;
+  align-items: center;
+}
+
+.tps-watch-settings-shortcuts {
+  justify-content: space-between;
+  gap: 14px;
   margin: 12px 0;
+  padding: 11px 12px;
   border: 1px solid var(--background-modifier-border);
   border-radius: 10px;
+  background: var(--background-secondary);
 }
 
-.tps-watch-settings-section > summary {
-  padding: 12px 14px;
-  cursor: pointer;
+.tps-watch-settings-shortcuts-copy {
+  min-width: 0;
+}
+
+.tps-watch-settings-shortcuts-copy strong,
+.tps-watch-settings-shortcuts-copy span {
+  display: block;
+}
+
+.tps-watch-settings-shortcuts-copy span {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.35;
+}
+
+.tps-watch-settings-shortcuts-actions {
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
+.tps-watch-settings-hub-heading {
+  margin: 18px 0 4px;
+}
+
+.tps-watch-settings-hub-description {
+  margin: 0;
+}
+
+.tps-watch-settings-hub {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 14px 0 20px;
+  padding: 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--background-primary) 94%, var(--background-secondary));
+  box-shadow: 0 6px 16px color-mix(in srgb, var(--background-primary) 72%, transparent);
+}
+
+.tps-watch-settings-route-button {
+  display: flex;
+  min-width: 0;
+  min-height: 66px;
+  height: auto;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  text-align: left;
+  white-space: normal;
+  box-shadow: none;
+}
+
+.tps-watch-settings-route-button:hover {
+  border-color: var(--interactive-accent);
+  background: var(--background-modifier-hover);
+}
+
+.tps-watch-settings-route-button:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
+.tps-watch-settings-route-button[aria-pressed="true"] {
+  border-color: var(--interactive-accent);
+  background: color-mix(in srgb, var(--interactive-accent) 14%, var(--background-secondary));
+  box-shadow: inset 0 0 0 1px var(--interactive-accent);
+}
+
+.tps-watch-settings-route-title {
   font-weight: 700;
+  line-height: 1.25;
 }
 
-.tps-watch-settings-body {
-  padding: 0 14px 8px;
+.tps-watch-settings-route-summary {
+  color: var(--text-accent);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.3;
+}
+
+.tps-watch-settings-route-description {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.35;
+}
+
+.tps-watch-settings-page {
+  min-width: 0;
+  padding-top: 6px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.tps-watch-settings-page > h3 {
+  margin-bottom: 4px;
+  scroll-margin-top: 110px;
+}
+
+.tps-watch-settings-page > h3:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.tps-watch-settings-page > h4 {
+  margin: 18px 0 2px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
+.tps-watch-settings-page-description {
+  margin-top: 0;
 }
 
 @media (max-width: 640px) {
+  .tps-watch-settings-shortcuts {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .tps-watch-settings-shortcuts-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .tps-watch-settings-shortcuts-actions button {
+    flex: 1 1 auto;
+  }
+
+  .tps-watch-settings-hub {
+    display: flex;
+    gap: 8px;
+    padding: 8px;
+    overflow-x: auto;
+    scroll-snap-type: x proximity;
+  }
+
+  .tps-watch-settings-route-button {
+    min-width: 150px;
+    min-height: 48px;
+    flex: 0 0 auto;
+    padding: 8px 9px;
+    scroll-snap-align: start;
+  }
+
+  .tps-watch-settings-route-description {
+    display: none;
+  }
+
+  .tps-watch-settings-page .setting-item {
+    display: block;
+  }
+
+  .tps-watch-settings-page .setting-item-control,
+  .tps-watch-settings-page .setting-item-control input[type="text"],
+  .tps-watch-settings-page .setting-item-control input[type="number"],
+  .tps-watch-settings-page .setting-item-control select {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .tps-watch-settings-page .setting-item-control {
+    margin-top: 8px;
+    justify-content: flex-start;
+  }
+
   .tps-watchlist-view {
     padding: 14px 10px;
   }

@@ -1,16 +1,17 @@
 # TPS Watchlist
 
-## 0.1.2
+## 0.2.0
 
-- Runtime watch-state writes and user settings writes remain separate and now both reload the newest plugin data before saving. State updates preserve settings; settings updates preserve states, synchronized unrelated choices, and unknown fields.
-- Overlapping settings edits retain quick reverts, and a queued newer write is not stranded by an earlier failure.
-- This backward-compatible patch keeps the minimum supported Obsidian version at 1.10.0 and requires no manual migration.
+- Settings now use three clean destinations for checks/reliability, files/events, and notifications/logs, rendering only the selected page.
+- Always-visible **Create watch** and **Open Watchlist** shortcuts make per-watch rules discoverable without duplicating those properties as global settings.
+- Existing watch notes, runtime state, and settings keys are unchanged. This backward-compatible minor release keeps the minimum supported Obsidian version at 1.10.0 and requires no migration.
 
 ## Development and deployment
 
 Canonical source, tests, Git metadata, and dependencies live in `/Users/zachtisherman/TishOS Plugin Development/TPS-Watchlist (Dev)`, outside both vaults. `npm run build` and watch builds deploy byte-changed runtime artifacts by default only to `/Users/zachtisherman/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Plugin Test Vault/.obsidian/plugins/tps-watchlist`; `npm test` is therefore isolated even though it ends with a production-mode build. Promotion to `/Users/zachtisherman/TishOS v0.1/.obsidian/plugins/tps-watchlist` is an explicit guarded post-validation action. Neither target overwrites `data.json` or other runtime-owned state.
 
 - 2026-07-16 isolation validation: all 15 declared tests and the required final `npm run build` passed with `[runtime-deploy] target=test ... unchanged`. Obsidian 1.12.7 loaded Watchlist in the registered test vault with no watch records or outbound requests and created only its empty QA Bases. No live promotion occurred, and production runtime checksums remained unchanged.
+- 2026-07-24 settings-release validation: the 20 core tests and four routed-settings tests all passed. The required final standalone build deployed only to `[runtime-deploy] target=test`. Obsidian 1.12.7 was reloaded with `Reload app without saving`; all three settings destinations and the shared nine-plugin `Choose what to configure` pattern were inspected in the registered test vault without creating a watch, running a check, changing settings, or sending a notification. Runtime-owned state remained absent and production was not accessed or promoted.
 
 ## Install with BRAT
 
@@ -221,18 +222,15 @@ api.getSettings()
 
 ## Settings
 
-- Automatic execution: Controller-only or this device
-- Default watch folder
-- Default interval
-- Scheduler tick
-- Request timeout
-- Concurrent checks
-- Failure alert threshold
-- Notify on repeated failures
-- Watchlist and Watch Events Base paths
-- Daily-note or watch-note event ownership
-- Default notification preference
-- Debug logging
+Settings use a sticky three-destination hub and render only the selected page:
+
+- **Checks & reliability** contains automatic execution, default interval, scheduler tick, request timeout, concurrent checks, failure alert threshold, and repeated-failure notification.
+- **Files & events** contains the default watch folder, Watchlist and Watch Events Base paths, daily-note or watch-note event ownership, and the **Ensure Bases** repair action.
+- **Notifications & logs** contains the default notification preference and debug logging.
+
+The always-visible **Create watch** and **Open Watchlist** shortcuts lead to the per-watch workflow where provider, condition, target, extraction, cadence, and notification overrides are configured. Those fields remain watch-note properties rather than global plugin settings.
+
+Route selection is transient UI state. No settings key was renamed or migrated. Hub buttons expose pressed state to assistive technology, route changes focus the active page heading, and narrow screens use a horizontal route strip with full-width setting controls.
 
 ## Diagnostics
 
@@ -272,10 +270,11 @@ Logs do not include source response bodies, full note bodies, complete settings 
 - `npm run test:core` exercises JSON paths, regex extraction, silent baselines, value changes, threshold transitions, availability precedence, deterministic fingerprints, atomic event append/dedupe, same-path single-flight checks, stable RSS item identity, and the silent legacy-baseline migration.
 - `npm test` runs focused core tests and the production TypeScript/esbuild build.
 - After source changes, rebuild and reload Obsidian before UI validation.
-- Obsidian 1.12.7 validation confirmed plugin load, ribbon registration, the empty dashboard, responsive create-watch modal, Controller-only defaults, collapsible settings, native Watchlist Base rendering, and zero-result behavior without creating a QA watch or external notification.
+- Obsidian 1.12.7 validation confirmed plugin load, ribbon registration, the empty dashboard, responsive create-watch modal, Controller-only defaults, native Watchlist Base rendering, zero-result behavior, and all three routed settings destinations without creating a QA watch or external notification.
 
 ## Version notes
 
-- 0.1.1: Isolated every watch worker and secondary failure-bookkeeping step so one broken identity write, provider, event target, state save, or dashboard render cannot reject the rest of a batch. Failure-event write errors retry at the configured threshold, transient path-keyed health state migrates when a durable watch ID can be assigned, and provider error summaries redact source URLs and credential-like parameters before logs or Markdown persistence. Validation: focused core regression tests and full `npm test`, including production build.
-- 0.1.1: Made watch-event append/dedupe atomic against the latest canonical note content, shared concurrent checks for the same watch path, and based RSS `new-item` fingerprints on stable item identity so content corrections do not trigger false new-item events. Existing RSS baselines migrate silently on their first successful post-upgrade check.
+- 0.2.0: Reorganized settings into a shallow accessible hub, added direct watch-creation/dashboard shortcuts, removed settings accordions, and added mobile destination navigation without changing settings or watch schemas.
+- 0.1.2: Separated settings intent from volatile watch state so state writes preserve preferences and settings writes preserve watch health, synchronized unrelated choices, rapid reverts, and unknown fields.
+- 0.1.1: Isolated watch workers and failure bookkeeping, made event append/dedupe atomic, shared same-watch concurrent checks, migrated path-keyed health state when durable IDs appear, based RSS fingerprints on stable identity, and redacted provider error targets.
 - 0.1.0: Initial contract-native watch entities, page/JSON/RSS providers, transition engine, persisted baselines, daily-note events, failure escalation, Controller-aware scheduling, dashboard, Bases, GCM actions, Notifier delivery, AI capabilities, public API, settings, diagnostics, and core tests.
