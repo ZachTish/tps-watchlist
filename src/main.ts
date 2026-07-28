@@ -186,14 +186,17 @@ export default class TPSWatchlistPlugin extends Plugin {
   }
 
   getWatchRows(): WatchRow[] {
-    return this.app.vault.getMarkdownFiles()
-      .map((file) => this.definitionFromFile(file))
-      .filter((definition): definition is WatchDefinition => definition != null)
-      .map((definition) => ({
+    const rows: WatchRow[] = [];
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const definition = this.definitionFromFile(file);
+      if (!definition) continue;
+      rows.push({
         definition,
         state: this.states[definition.id] || createEmptyState(),
         active: isActiveStatus(definition.status),
-      }));
+      });
+    }
+    return rows;
   }
 
   async checkAll(reason = "api"): Promise<WatchCheckResult[]> {
@@ -412,20 +415,22 @@ export default class TPSWatchlistPlugin extends Plugin {
     }
     this.batchInFlight = true;
     const started = Date.now();
-    const queue = definitions.slice();
+    const definitionSnapshot = definitions.slice();
+    let nextDefinitionIndex = 0;
     const results: WatchCheckResult[] = [];
     logger.flow("Check", "batch:start", {
       reason,
       dueOnly,
-      count: queue.length,
+      count: definitionSnapshot.length,
       concurrency: this.settings.maxConcurrentChecks,
     });
     try {
       const workers = Array.from(
-        { length: Math.min(this.settings.maxConcurrentChecks, Math.max(1, queue.length)) },
+        { length: Math.min(this.settings.maxConcurrentChecks, Math.max(1, definitionSnapshot.length)) },
         async () => {
-          while (queue.length) {
-            const definition = queue.shift();
+          while (nextDefinitionIndex < definitionSnapshot.length) {
+            const definition = definitionSnapshot[nextDefinitionIndex];
+            nextDefinitionIndex += 1;
             if (!definition) break;
             try {
               results.push(await this.checkOne(definition, reason));

@@ -1,5 +1,12 @@
 # TPS Watchlist
 
+## 0.2.1
+
+- Vault-wide watch discovery now builds rows in one ordered pass instead of creating map/filter/map intermediates.
+- Concurrent batches claim their existing shallow definition snapshot by index instead of repeatedly shifting the front of an array.
+- Watch order, worker concurrency, completion-order results, persistence/recovery, provider behavior, settings, and stored watch state remain unchanged.
+- This backward-compatible performance patch keeps the minimum supported Obsidian version at 1.10.0 and requires no migration.
+
 ## 0.2.0
 
 - Settings now use three clean destinations for checks/reliability, files/events, and notifications/logs, rendering only the selected page.
@@ -12,6 +19,7 @@ Canonical source, tests, Git metadata, and dependencies live in `/Users/zachtish
 
 - 2026-07-16 isolation validation: all 15 declared tests and the required final `npm run build` passed with `[runtime-deploy] target=test ... unchanged`. Obsidian 1.12.7 loaded Watchlist in the registered test vault with no watch records or outbound requests and created only its empty QA Bases. No live promotion occurred, and production runtime checksums remained unchanged.
 - 2026-07-24 settings-release validation: the 20 core tests and four routed-settings tests all passed. The required final standalone build deployed only to `[runtime-deploy] target=test`. Obsidian 1.12.7 was reloaded with `Reload app without saving`; all three settings destinations and the shared nine-plugin `Choose what to configure` pattern were inspected in the registered test vault without creating a watch, running a check, changing settings, or sending a notification. Runtime-owned state remained absent and production was not accessed or promoted.
+- 2026-07-28 efficiency validation: all 22 core tests and four routed-settings tests passed, including executable coverage of one-parse ordered discovery, snapshot isolation, bounded worker claiming, and completion-order results. The required standalone build deployed only to `[runtime-deploy] target=test`. After **Reload app without saving**, Obsidian 1.12.7 registered the Watchlist commands and rendered the empty dashboard. No watch was created, no check or outbound request ran, runtime-owned state remained absent, and production was not accessed or promoted.
 
 ## Install with BRAT
 
@@ -274,6 +282,7 @@ Logs do not include source response bodies, full note bodies, complete settings 
 
 ## Version notes
 
+- 0.2.1: Replaced vault-wide watch-row intermediates with one ordered loop and changed batch work claiming from repeated front shifts to constant-time indexed access.
 - 0.2.0: Reorganized settings into a shallow accessible hub, added direct watch-creation/dashboard shortcuts, removed settings accordions, and added mobile destination navigation without changing settings or watch schemas.
 - 0.1.2: Separated settings intent from volatile watch state so state writes preserve preferences and settings writes preserve watch health, synchronized unrelated choices, rapid reverts, and unknown fields.
 - 0.1.1: Isolated watch workers and failure bookkeeping, made event append/dedupe atomic, shared same-watch concurrent checks, migrated path-keyed health state when durable IDs appear, based RSS fingerprints on stable identity, and redacted provider error targets.

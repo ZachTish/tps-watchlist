@@ -15,6 +15,7 @@ import {
   stableHash,
   WATCH_FINGERPRINT_VERSION,
 } from "../src/core";
+import TPSWatchlistPlugin from "../src/main";
 import { WatchlistPersistenceCoordinator } from "../src/persistence";
 import type { WatchDefinition, WatchObservation } from "../src/types";
 
@@ -46,6 +47,114 @@ const observation = (value: string, fingerprint = stableHash(value)): WatchObser
   numericValue: parseNumericValue(value),
   fingerprint,
   summary: value,
+});
+
+const flushAsyncWork = async (): Promise<void> => {
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+};
+
+test("watch rows preserve file order and parse each Markdown file once", () => {
+  const files = [
+    { path: "Watches/First.md" },
+    { path: "Notes/Not a watch.md" },
+    { path: "Watches/Second.md" },
+  ];
+  const first = definition({ id: "first", path: files[0].path, status: "working" });
+  const second = definition({ id: "second", path: files[2].path, status: "holding" });
+  const definitionsByPath = new Map<string, WatchDefinition>([
+    [first.path, first],
+    [second.path, second],
+  ]);
+  const calls: string[] = [];
+  const firstState = { ...createEmptyState(), lastValue: "existing" };
+  const plugin = Object.create(TPSWatchlistPlugin.prototype) as any;
+  plugin.app = {
+    vault: { getMarkdownFiles: () => files },
+  };
+  plugin.states = { first: firstState };
+  plugin.definitionFromFile = (file: { path: string }) => {
+    calls.push(file.path);
+    return definitionsByPath.get(file.path) || null;
+  };
+
+  const rows = plugin.getWatchRows();
+
+  assert.deepEqual(calls, files.map((file) => file.path));
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].definition, first);
+  assert.equal(rows[0].state, firstState);
+  assert.equal(rows[0].active, true);
+  assert.equal(rows[1].definition, second);
+  assert.deepEqual(rows[1].state, createEmptyState());
+  assert.equal(rows[1].active, false);
+});
+
+test("concurrent watch checks consume one structural snapshot by index", async () => {
+  const definitions = ["a", "b", "c", "d", "e"].map((id) => definition({
+    id,
+    path: "Watches/" + id + ".md",
+  }));
+  const snapshot = definitions.slice();
+  const numericReads: number[] = [];
+  const guardedSnapshot = new Proxy(snapshot, {
+    get(target, property, receiver) {
+      if (property === "shift") {
+        throw new Error("workers must not shift the definition snapshot");
+      }
+      if (typeof property === "string" && /^\d+$/.test(property)) {
+        numericReads.push(Number(property));
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const guardedInput = new Proxy(definitions, {
+    get(target, property, receiver) {
+      if (property === "slice") return () => guardedSnapshot;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const starts: string[] = [];
+  const releases = new Map<string, () => void>();
+  let persisted = 0;
+  let refreshed = 0;
+  const plugin = Object.create(TPSWatchlistPlugin.prototype) as any;
+  plugin.batchInFlight = false;
+  plugin.settings = { maxConcurrentChecks: 2 };
+  plugin.checkOne = (item: WatchDefinition) => {
+    starts.push(item.id);
+    return new Promise((resolve) => {
+      releases.set(item.id, () => resolve({
+        watchId: item.id,
+        path: item.path,
+        outcome: "unchanged",
+      }));
+    });
+  };
+  plugin.persistStates = async () => { persisted += 1; };
+  plugin.refreshViews = async () => { refreshed += 1; };
+
+  const batch = plugin.checkDefinitions(guardedInput, "test", false);
+  assert.deepEqual(starts, ["a", "b"]);
+
+  definitions.splice(2);
+  releases.get("b")?.();
+  await flushAsyncWork();
+  assert.deepEqual(starts, ["a", "b", "c"]);
+  releases.get("a")?.();
+  await flushAsyncWork();
+  assert.deepEqual(starts, ["a", "b", "c", "d"]);
+  releases.get("d")?.();
+  await flushAsyncWork();
+  assert.deepEqual(starts, ["a", "b", "c", "d", "e"]);
+  releases.get("c")?.();
+  releases.get("e")?.();
+
+  const results = await batch;
+  assert.deepEqual(results.map((result: { watchId: string }) => result.watchId), ["b", "a", "d", "c", "e"]);
+  assert.deepEqual(numericReads, [0, 1, 2, 3, 4]);
+  assert.equal(persisted, 1);
+  assert.equal(refreshed, 1);
+  assert.equal(plugin.batchInFlight, false);
 });
 
 test("resolves nested JSON paths and bracket indexes", () => {

@@ -1,7 +1,7 @@
 {
   "id": "tps-watchlist",
   "name": "TPS Watchlist",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "minAppVersion": "1.10.0",
   "description": "Contract-native monitoring for products, prices, releases, feeds, markets, and other external changes.",
   "author": "Zach Tisherman",
