@@ -297,6 +297,251 @@ test("state-only persistence reloads and preserves synchronized settings and unk
   assert.equal(writes, 2);
 });
 
+test("overlapping Watchlist state saves persist the active and newest snapshots only", async () => {
+  let disk: Record<string, unknown> = {
+    settings: { executionMode: "controller", futureSetting: { enabled: true } },
+    states: {},
+    futureTopLevel: { version: 2 },
+  };
+  let reads = 0;
+  let writes = 0;
+  let activeWrites = 0;
+  let maxActiveWrites = 0;
+  let markFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+  let releaseFirstWrite!: () => void;
+  const firstWriteGate = new Promise<void>((resolve) => { releaseFirstWrite = resolve; });
+  const persistence = new WatchlistPersistenceCoordinator(
+    async () => {
+      reads += 1;
+      return structuredClone(disk);
+    },
+    async (data) => {
+      writes += 1;
+      activeWrites += 1;
+      maxActiveWrites = Math.max(maxActiveWrites, activeWrites);
+      try {
+        if (writes === 1) {
+          markFirstStarted();
+          await firstWriteGate;
+        }
+        disk = structuredClone(data);
+      } finally {
+        activeWrites -= 1;
+      }
+    },
+  );
+  persistence.setSettingsBaseline({ executionMode: "controller" });
+
+  const newestStates: Record<string, { lastValue: string }> = {
+    "watch-0": { lastValue: "value-0" },
+  };
+  const saves = [persistence.saveStates(newestStates)];
+  await firstStarted;
+  for (let index = 1; index < 100; index += 1) {
+    newestStates[`watch-${index}`] = { lastValue: `value-${index}` };
+    saves.push(persistence.saveStates(newestStates));
+  }
+  releaseFirstWrite();
+  const results = await Promise.all(saves);
+
+  assert.equal(reads, 2);
+  assert.equal(writes, 2);
+  assert.equal(maxActiveWrites, 1);
+  assert.equal(results.length, 100);
+  assert.deepEqual(disk, {
+    settings: { executionMode: "controller", futureSetting: { enabled: true } },
+    states: newestStates,
+    futureTopLevel: { version: 2 },
+  });
+  assert.deepEqual(results[0]?.states, { "watch-0": { lastValue: "value-0" } });
+  for (const result of results.slice(1)) assert.deepEqual(result.states, newestStates);
+});
+
+test("a failed active Watchlist state write does not strand the newest queued snapshot", async () => {
+  let disk: Record<string, unknown> = {
+    settings: { executionMode: "controller" },
+    states: {},
+    futureTopLevel: ["keep"],
+  };
+  let reads = 0;
+  let attempts = 0;
+  let markFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+  let releaseFailure!: () => void;
+  const failureGate = new Promise<void>((resolve) => { releaseFailure = resolve; });
+  const persistence = new WatchlistPersistenceCoordinator(
+    async () => {
+      reads += 1;
+      return structuredClone(disk);
+    },
+    async (data) => {
+      attempts += 1;
+      if (attempts === 1) {
+        markFirstStarted();
+        await failureGate;
+        throw new Error("first state write failed");
+      }
+      disk = structuredClone(data);
+    },
+  );
+  persistence.setSettingsBaseline({ executionMode: "controller" });
+
+  const failed = persistence.saveStates({ "watch-0": { lastValue: "first" } });
+  const failureObserved = assert.rejects(failed, /first state write failed/);
+  await firstStarted;
+  const newestStates: Record<string, { lastValue: string }> = {};
+  const queued: Array<Promise<Record<string, unknown>>> = [];
+  for (let index = 1; index <= 20; index += 1) {
+    newestStates[`watch-${index}`] = { lastValue: `value-${index}` };
+    queued.push(persistence.saveStates(newestStates));
+  }
+  releaseFailure();
+  await failureObserved;
+  await Promise.all(queued);
+
+  assert.equal(reads, 2);
+  assert.equal(attempts, 2);
+  assert.deepEqual(disk, {
+    settings: { executionMode: "controller" },
+    states: newestStates,
+    futureTopLevel: ["keep"],
+  });
+});
+
+test("a failed coalesced Watchlist state attempt preserves every later caller", async () => {
+  let disk: Record<string, unknown> = {
+    settings: { executionMode: "controller" },
+    states: {},
+    futureTopLevel: { keep: true },
+  };
+  let reads = 0;
+  let attempts = 0;
+  let markFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+  let releaseFirstWrite!: () => void;
+  const firstWriteGate = new Promise<void>((resolve) => { releaseFirstWrite = resolve; });
+  const persistence = new WatchlistPersistenceCoordinator(
+    async () => {
+      reads += 1;
+      return structuredClone(disk);
+    },
+    async (data) => {
+      attempts += 1;
+      if (attempts === 1) {
+        markFirstStarted();
+        await firstWriteGate;
+      } else if (attempts === 2) {
+        throw new Error("coalesced state write failed");
+      }
+      disk = structuredClone(data);
+    },
+  );
+  persistence.setSettingsBaseline({ executionMode: "controller" });
+
+  const active = persistence.saveStates({ active: { lastValue: "first" } });
+  await firstStarted;
+  const newestStates: Record<string, { lastValue: string }> = {};
+  const queued: Array<Promise<Record<string, unknown>>> = [];
+  for (let index = 0; index < 20; index += 1) {
+    newestStates[`watch-${index}`] = { lastValue: `value-${index}` };
+    queued.push(persistence.saveStates(newestStates));
+  }
+  releaseFirstWrite();
+  await active;
+  const settled = await Promise.allSettled(queued);
+
+  assert.equal(reads, 3);
+  assert.equal(attempts, 3);
+  assert.equal(settled[0]?.status, "rejected");
+  assert.match(String((settled[0] as PromiseRejectedResult).reason), /coalesced state write failed/);
+  assert.ok(settled.slice(1).every((result) => result.status === "fulfilled"));
+  assert.deepEqual(disk, {
+    settings: { executionMode: "controller" },
+    states: newestStates,
+    futureTopLevel: { keep: true },
+  });
+});
+
+test("Watchlist state coalescing preserves an interleaved settings-write boundary", async () => {
+  let disk: Record<string, unknown> = {
+    settings: { settingA: "old", settingB: "synchronized", futureSetting: true },
+    states: {},
+    futureTopLevel: { keep: true },
+  };
+  let reads = 0;
+  let writes = 0;
+  const writeHistory: Array<Record<string, unknown>> = [];
+  let markFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+  let releaseFirstWrite!: () => void;
+  const firstWriteGate = new Promise<void>((resolve) => { releaseFirstWrite = resolve; });
+  const persistence = new WatchlistPersistenceCoordinator(
+    async () => {
+      reads += 1;
+      return structuredClone(disk);
+    },
+    async (data) => {
+      writes += 1;
+      if (writes === 1) {
+        markFirstStarted();
+        await firstWriteGate;
+      }
+      disk = structuredClone(data);
+      writeHistory.push(structuredClone(data));
+    },
+  );
+  persistence.setSettingsBaseline({ settingA: "old", settingB: "old" });
+
+  const first = persistence.saveStates({ active: { lastValue: "first" } });
+  await firstStarted;
+  const beforeSettingsStates: Record<string, { lastValue: string }> = {};
+  const beforeSettings: Array<Promise<Record<string, unknown>>> = [];
+  for (let index = 0; index < 10; index += 1) {
+    beforeSettingsStates[`before-${index}`] = { lastValue: `value-${index}` };
+    beforeSettings.push(persistence.saveStates(beforeSettingsStates));
+  }
+  const settings = persistence.saveSettings({ settingA: "local", settingB: "old" });
+  const newestStates: Record<string, { lastValue: string }> = {};
+  const afterSettings: Array<Promise<Record<string, unknown>>> = [];
+  for (let index = 0; index < 10; index += 1) {
+    newestStates[`after-${index}`] = { lastValue: `value-${index}` };
+    afterSettings.push(persistence.saveStates(newestStates));
+  }
+  releaseFirstWrite();
+  await Promise.all([first, ...beforeSettings, settings, ...afterSettings]);
+
+  assert.equal(reads, 4);
+  assert.equal(writes, 4);
+  assert.deepEqual(disk, {
+    settings: { settingA: "local", settingB: "synchronized", futureSetting: true },
+    states: newestStates,
+    futureTopLevel: { keep: true },
+  });
+  assert.deepEqual(writeHistory, [
+    {
+      settings: { settingA: "old", settingB: "synchronized", futureSetting: true },
+      states: { active: { lastValue: "first" } },
+      futureTopLevel: { keep: true },
+    },
+    {
+      settings: { settingA: "old", settingB: "synchronized", futureSetting: true },
+      states: beforeSettingsStates,
+      futureTopLevel: { keep: true },
+    },
+    {
+      settings: { settingA: "local", settingB: "synchronized", futureSetting: true },
+      states: beforeSettingsStates,
+      futureTopLevel: { keep: true },
+    },
+    {
+      settings: { settingA: "local", settingB: "synchronized", futureSetting: true },
+      states: newestStates,
+      futureTopLevel: { keep: true },
+    },
+  ]);
+});
+
 test("overlapping Watchlist settings writes retain an in-flight revert", async () => {
   let disk: Record<string, unknown> = { settings: { settingA: "old", futureSetting: true }, states: {} };
   let releaseFirstWrite!: () => void;

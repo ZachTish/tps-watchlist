@@ -1,5 +1,12 @@
 # TPS Watchlist
 
+## 0.2.2
+
+- Overlapping watch-state saves now keep the active persistence operation and only the newest superseding snapshot in each queued group.
+- Settings writes remain hard ordering boundaries, and a failed state attempt still rejects one original caller while later original save requests retain their own attempt.
+- In the deterministic 100-call overlap regression, persistence work falls from 100 serialized read/write pairs to two while every call still takes an independent JSON snapshot.
+- This backward-compatible reliability and performance patch preserves watch behavior, settings, stored data, and the minimum supported Obsidian version of 1.10.0.
+
 ## 0.2.1
 
 - Vault-wide watch discovery now builds rows in one ordered pass instead of creating map/filter/map intermediates.
@@ -20,6 +27,7 @@ Canonical source, tests, Git metadata, and dependencies live in `/Users/zachtish
 - 2026-07-16 isolation validation: all 15 declared tests and the required final `npm run build` passed with `[runtime-deploy] target=test ... unchanged`. Obsidian 1.12.7 loaded Watchlist in the registered test vault with no watch records or outbound requests and created only its empty QA Bases. No live promotion occurred, and production runtime checksums remained unchanged.
 - 2026-07-24 settings-release validation: the 20 core tests and four routed-settings tests all passed. The required final standalone build deployed only to `[runtime-deploy] target=test`. Obsidian 1.12.7 was reloaded with `Reload app without saving`; all three settings destinations and the shared nine-plugin `Choose what to configure` pattern were inspected in the registered test vault without creating a watch, running a check, changing settings, or sending a notification. Runtime-owned state remained absent and production was not accessed or promoted.
 - 2026-07-28 efficiency validation: all 22 core tests and four routed-settings tests passed, including executable coverage of one-parse ordered discovery, snapshot isolation, bounded worker claiming, and completion-order results. The required standalone build deployed only to `[runtime-deploy] target=test`. After **Reload app without saving**, Obsidian 1.12.7 registered the Watchlist commands and rendered the empty dashboard. No watch was created, no check or outbound request ran, runtime-owned state remained absent, and production was not accessed or promoted.
+- 2026-07-30 persistence-release validation: all 26 core tests and four routed-settings tests passed, including exact coverage of active-plus-newest state coalescing, per-caller transient-failure progression, settings-write barriers, synchronized/unknown-field preservation, and serialized writes. The required standalone build deployed only to `[runtime-deploy] target=test` and a second post-QA build was byte-unchanged. After **Reload app without saving**, Obsidian 1.12.7 rendered all three settings destinations and the empty Watchlist dashboard. No setting changed, no watch was created, no check or outbound request ran, runtime-owned `data.json` remained absent, and production was not accessed or promoted.
 
 ## Install with BRAT
 
@@ -40,7 +48,7 @@ The plugin treats a watch as a durable entity note, an observation as derived st
 - Daily notes own events by default.
 - Event lines remain human-readable and keep machine fields in a compact HTML comment.
 - Baselines, fingerprints, current values, check health, cooldown state, and notification dedupe state live in plugin `data.json`.
-- Settings saves and watch-state saves use separate serialized merge paths. State-only writes first reload `data.json` and preserve synchronized settings and unknown fields; settings writes preserve the newest states and unknown top-level data. A failed reload aborts the write.
+- Settings saves and watch-state saves use separate serialized merge paths. State-only writes first reload `data.json` and preserve synchronized settings and unknown fields; settings writes preserve the newest states and unknown top-level data. Superseded queued state snapshots coalesce without crossing an active write or settings boundary. Every caller retains a call-time JSON snapshot and observable failure opportunity, and a failed reload aborts that attempt without stranding later requests.
 - Provider response bodies are never persisted.
 - Tasks are created only through an explicit follow-up workflow; watch events are not checkboxes.
 

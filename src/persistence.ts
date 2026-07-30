@@ -1,9 +1,20 @@
 export type PersistedPluginData = Record<string, unknown>;
 
+interface QueuedStateSave<TStates> {
+  snapshot: TStates;
+  requests: StateSaveRequest[];
+}
+
+interface StateSaveRequest {
+  resolve: (data: PersistedPluginData) => void;
+  reject: (reason: unknown) => void;
+}
+
 export class WatchlistPersistenceCoordinator<TSettings extends object, TStates extends object> {
   private serial: Promise<void> = Promise.resolve();
   private settingsBaseline: PersistedPluginData = {};
   private desiredSettings: PersistedPluginData = {};
+  private queuedStateSave: QueuedStateSave<TStates> | null = null;
 
   constructor(
     private readonly read: () => Promise<unknown>,
@@ -17,12 +28,22 @@ export class WatchlistPersistenceCoordinator<TSettings extends object, TStates e
 
   saveStates(states: TStates): Promise<PersistedPluginData> {
     const snapshot = cloneJsonSnapshot(states);
-    return this.enqueue(async () => {
-      const latest = requirePluginData(await this.read());
-      const merged = { ...latest, states: snapshot };
-      await this.write(merged);
-      return merged;
+    let resolveRequest!: (data: PersistedPluginData) => void;
+    let rejectRequest!: (reason: unknown) => void;
+    const promise = new Promise<PersistedPluginData>((resolve, reject) => {
+      resolveRequest = resolve;
+      rejectRequest = reject;
     });
+    const request = { resolve: resolveRequest, reject: rejectRequest };
+    if (this.queuedStateSave) {
+      this.queuedStateSave.snapshot = snapshot;
+      this.queuedStateSave.requests.push(request);
+      return promise;
+    }
+    const batch: QueuedStateSave<TStates> = { snapshot, requests: [request] };
+    this.queuedStateSave = batch;
+    void this.enqueue(() => this.flushStateSave(batch));
+    return promise;
   }
 
   saveSettings(settings: TSettings): Promise<PersistedPluginData> {
@@ -30,6 +51,7 @@ export class WatchlistPersistenceCoordinator<TSettings extends object, TStates e
     const changedKeys = changedRecordKeys(this.settingsBaseline, snapshot);
     for (const key of changedRecordKeys(this.desiredSettings, snapshot)) changedKeys.add(key);
     this.desiredSettings = cloneJsonSnapshot(snapshot);
+    this.queuedStateSave = null;
     return this.enqueue(async () => {
       const latest = requirePluginData(await this.read());
       const latestSettings = optionalRecord(latest.settings);
@@ -41,6 +63,23 @@ export class WatchlistPersistenceCoordinator<TSettings extends object, TStates e
       this.settingsBaseline = cloneJsonSnapshot(snapshot);
       return merged;
     });
+  }
+
+  private async flushStateSave(batch: QueuedStateSave<TStates>): Promise<void> {
+    if (this.queuedStateSave === batch) this.queuedStateSave = null;
+    while (batch.requests.length > 0) {
+      try {
+        const latest = requirePluginData(await this.read());
+        const merged = { ...latest, states: batch.snapshot };
+        await this.write(merged);
+        for (const request of batch.requests) request.resolve(merged);
+        batch.requests.length = 0;
+      } catch (error) {
+        // Preserve the old queue contract: one failed attempt rejects one caller,
+        // while each later save request still receives an attempt.
+        batch.requests.shift()?.reject(error);
+      }
+    }
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
