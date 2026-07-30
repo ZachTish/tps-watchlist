@@ -1,5 +1,12 @@
 # TPS Watchlist
 
+## 0.2.3
+
+- Watch batches now rebuild open dashboards once after all workers finish instead of once per failed watch plus once at batch completion.
+- Direct check, pause/resume, and dashboard actions retain one operation-owned refresh, with refresh failures isolated from the completed watch result.
+- A deterministic 100-failure batch over 1,000 Markdown files falls from 101 dashboard rebuilds and 101,000 file parses to one rebuild and 1,000 parses.
+- Provider checks, failure counters, state persistence, events, notifications, commands, settings, public APIs, and minimum Obsidian compatibility are unchanged.
+
 ## 0.2.2
 
 - Overlapping watch-state saves now keep the active persistence operation and only the newest superseding snapshot in each queued group.
@@ -28,6 +35,7 @@ Canonical source, tests, Git metadata, and dependencies live in `/Users/zachtish
 - 2026-07-24 settings-release validation: the 20 core tests and four routed-settings tests all passed. The required final standalone build deployed only to `[runtime-deploy] target=test`. Obsidian 1.12.7 was reloaded with `Reload app without saving`; all three settings destinations and the shared nine-plugin `Choose what to configure` pattern were inspected in the registered test vault without creating a watch, running a check, changing settings, or sending a notification. Runtime-owned state remained absent and production was not accessed or promoted.
 - 2026-07-28 efficiency validation: all 22 core tests and four routed-settings tests passed, including executable coverage of one-parse ordered discovery, snapshot isolation, bounded worker claiming, and completion-order results. The required standalone build deployed only to `[runtime-deploy] target=test`. After **Reload app without saving**, Obsidian 1.12.7 registered the Watchlist commands and rendered the empty dashboard. No watch was created, no check or outbound request ran, runtime-owned state remained absent, and production was not accessed or promoted.
 - 2026-07-30 persistence-release validation: all 26 core tests and four routed-settings tests passed, including exact coverage of active-plus-newest state coalescing, per-caller transient-failure progression, settings-write barriers, synchronized/unknown-field preservation, and serialized writes. The required standalone build deployed only to `[runtime-deploy] target=test` and a second post-QA build was byte-unchanged. After **Reload app without saving**, Obsidian 1.12.7 rendered all three settings destinations and the empty Watchlist dashboard. No setting changed, no watch was created, no check or outbound request ran, runtime-owned `data.json` remained absent, and production was not accessed or promoted.
+- 2026-07-30 dashboard-refresh validation: the exact 0.2.2 path rebuilt views 101 times and parsed 101,000 Markdown fixtures for a 100-failure batch over a 1,000-file vault. Version 0.2.3 produced the same 100 failed results, failure counters, and 101 persistence requests while rebuilding once and parsing 1,000 files. Direct successful and failed checks each refreshed once, and a synthetic refresh rejection remained isolated. All 28 core tests and four routed-settings tests passed. Obsidian 1.12.7 reloaded the registered test vault and rendered the empty dashboard; **Check all**, **New watch**, and outbound integrations were not invoked. Runtime-owned `data.json` remained absent, and production was not accessed.
 
 ## Install with BRAT
 
@@ -146,6 +154,7 @@ Numeric parsing supports signs, thousands separators, decimals, currency text, a
 - Consecutive failures are counted without writing one log per poll.
 - Reaching the configured failure threshold writes one error event and optionally sends one notification.
 - A failed identity write, provider request, failure-event append, state save, or dashboard refresh is isolated to that watch. Concurrent workers continue checking the rest of the batch, and the batch returns one result per requested watch instead of rejecting wholesale.
+- Batch state changes are rendered together in one final dashboard refresh. Direct single-watch checks refresh once after either success or failure.
 - If the threshold error event cannot be written, the counter remains immediately below the threshold so the escalation is retried on the next check rather than being lost.
 - A successful check clears the failure state and permits a future failure escalation.
 
@@ -187,6 +196,8 @@ The dashboard renders derived runtime state without copying it into note frontma
 - Consecutive failure state
 - Check, pause/resume, and open actions
 - Search across title, provider, condition, target, path, and tags
+
+Check-all, per-row check, and pause/resume actions rely on the operation that changed state to refresh every open dashboard exactly once; the view does not immediately repeat that render.
 
 `Watchlist.base` is a native note-oriented Base filtered by `kind == "watch"`.
 
@@ -283,13 +294,15 @@ Logs do not include source response bodies, full note bodies, complete settings 
 
 ## Validation
 
-- `npm run test:core` exercises JSON paths, regex extraction, silent baselines, value changes, threshold transitions, availability precedence, deterministic fingerprints, atomic event append/dedupe, same-path single-flight checks, stable RSS item identity, and the silent legacy-baseline migration.
+- `npm run test:core` exercises JSON paths, regex extraction, silent baselines, value changes, threshold transitions, availability precedence, deterministic fingerprints, atomic event append/dedupe, same-path single-flight checks, stable RSS item identity, the silent legacy-baseline migration, batch refresh coalescing, and direct-check refresh ownership.
 - `npm test` runs focused core tests and the production TypeScript/esbuild build.
 - After source changes, rebuild and reload Obsidian before UI validation.
 - Obsidian 1.12.7 validation confirmed plugin load, ribbon registration, the empty dashboard, responsive create-watch modal, Controller-only defaults, native Watchlist Base rendering, zero-result behavior, and all three routed settings destinations without creating a QA watch or external notification.
 
 ## Version notes
 
+- 0.2.3: Coalesced failed-batch dashboard work into one final refresh and removed redundant action-level rerenders while preserving one isolated refresh for direct checks and status changes.
+- 0.2.2: Coalesced overlapping watch-state persistence to the active plus newest snapshots without crossing settings-write boundaries or losing per-caller failure progression.
 - 0.2.1: Replaced vault-wide watch-row intermediates with one ordered loop and changed batch work claiming from repeated front shifts to constant-time indexed access.
 - 0.2.0: Reorganized settings into a shallow accessible hub, added direct watch-creation/dashboard shortcuts, removed settings accordions, and added mobile destination navigation without changing settings or watch schemas.
 - 0.1.2: Separated settings intent from volatile watch state so state writes preserve preferences and settings writes preserve watch health, synchronized unrelated choices, rapid reverts, and unknown fields.

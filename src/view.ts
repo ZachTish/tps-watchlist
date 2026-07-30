@@ -49,7 +49,6 @@ export class WatchlistView extends ItemView {
       const events = results.filter((result) => result.outcome === "event").length;
       const failures = results.filter((result) => result.outcome === "failed").length;
       new Notice("Watchlist check finished: " + events + " event(s), " + failures + " failure(s).");
-      await this.render();
     }, true);
 
     const tools = root.createDiv({ cls: "tps-watchlist-tools" });
@@ -134,11 +133,9 @@ export class WatchlistView extends ItemView {
     actionButton(actions, "refresh-cw", "Check", async () => {
       const result = await this.plugin.checkPath(row.definition.path, "dashboard-row");
       if (result.outcome === "failed") new Notice(result.error || "Watch check failed.");
-      await this.render();
     });
     actionButton(actions, row.active ? "pause" : "play", row.active ? "Pause" : "Resume", async () => {
       await this.plugin.toggleWatchStatus(row.definition.path);
-      await this.render();
     });
     actionButton(actions, "external-link", "Open", () => this.plugin.openWatchFile(row.definition.path));
   }

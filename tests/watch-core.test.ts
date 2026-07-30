@@ -1,6 +1,7 @@
 import test from "node:test";
 import * as assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { TFile } from "obsidian";
 import {
   appendLineOnce,
   createFeedSourceIdentity,
@@ -155,6 +156,102 @@ test("concurrent watch checks consume one structural snapshot by index", async (
   assert.equal(persisted, 1);
   assert.equal(refreshed, 1);
   assert.equal(plugin.batchInFlight, false);
+});
+
+test("failed watch batches rebuild open dashboards only once", async () => {
+  const definitions = Array.from({ length: 100 }, (_, index) => definition({
+    id: "failed-" + index,
+    path: "Watches/Failed " + index + ".md",
+  }));
+  const markdownFiles = Array.from({ length: 1000 }, (_, index) => ({
+    path: "Notes/Fixture " + index + ".md",
+  }));
+  const plugin = Object.create(TPSWatchlistPlugin.prototype) as any;
+  let persisted = 0;
+  let refreshed = 0;
+  let parsedFiles = 0;
+  const originalConsoleError = console.error;
+  const failureLogs: unknown[][] = [];
+  plugin.batchInFlight = false;
+  plugin.settings = {
+    maxConcurrentChecks: 8,
+    failureAlertThreshold: 3,
+    notifyOnFailure: false,
+  };
+  plugin.states = {};
+  plugin.persistStates = async () => { persisted += 1; };
+  plugin.checkOne = async (item: WatchDefinition) =>
+    await plugin.handleFailure(item, new Error("synthetic provider failure"), "test");
+  plugin.app = {
+    vault: { getMarkdownFiles: () => markdownFiles },
+  };
+  plugin.definitionFromFile = () => {
+    parsedFiles += 1;
+    return null;
+  };
+  plugin.refreshViews = async () => {
+    refreshed += 1;
+    plugin.getWatchRows();
+  };
+  console.error = (...args) => failureLogs.push(args);
+
+  let results;
+  try {
+    results = await plugin.checkDefinitions(definitions, "test", false);
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.equal(results.length, 100);
+  assert.ok(results.every((result: { outcome: string }) => result.outcome === "failed"));
+  assert.ok(definitions.every((item) => plugin.states[item.id]?.failureCount === 1));
+  assert.equal(persisted, 101);
+  assert.equal(failureLogs.length, 100);
+  assert.equal(refreshed, 1);
+  assert.equal(parsedFiles, 1000);
+});
+
+test("direct watch checks own one failure-isolated dashboard refresh", async () => {
+  const file = Object.assign(new TFile(), {
+    path: "Watches/Direct.md",
+    extension: "md",
+  });
+  const watch = definition({ path: file.path });
+  const plugin = Object.create(TPSWatchlistPlugin.prototype) as any;
+  let refreshed = 0;
+  plugin.app = {
+    vault: { getAbstractFileByPath: () => file },
+  };
+  plugin.definitionFromFile = () => watch;
+  plugin.refreshViews = async () => { refreshed += 1; };
+
+  plugin.checkOne = async () => ({
+    watchId: watch.id,
+    path: watch.path,
+    outcome: "unchanged",
+  });
+  assert.equal((await plugin.checkPath(file.path, "test-success")).outcome, "unchanged");
+
+  plugin.checkOne = async () => ({
+    watchId: watch.id,
+    path: watch.path,
+    outcome: "failed",
+    error: "synthetic failure",
+  });
+  assert.equal((await plugin.checkPath(file.path, "test-failure")).outcome, "failed");
+  assert.equal(refreshed, 2);
+
+  const originalConsoleError = console.error;
+  const failureLogs: unknown[][] = [];
+  console.error = (...args) => failureLogs.push(args);
+  plugin.refreshViews = async () => { throw new Error("synthetic refresh failure"); };
+  try {
+    assert.equal((await plugin.checkPath(file.path, "test-refresh-failure")).outcome, "failed");
+  } finally {
+    console.error = originalConsoleError;
+  }
+  assert.equal(failureLogs.length, 1);
+  assert.match(String(failureLogs[0]?.[0]), /path:view-refresh-failed/);
 });
 
 test("resolves nested JSON paths and bracket indexes", () => {
@@ -660,13 +757,16 @@ test("Watchlist integrates single-flight checks and atomic vault processing", ()
 
 test("Watchlist isolates failed checks and secondary failure bookkeeping", () => {
   const source = readFileSync("src/main.ts", "utf8");
+  const viewSource = readFileSync("src/view.ts", "utf8");
   assert.match(source, /try \{\s*results\.push\(await this\.checkOne\(definition, reason\)\);\s*\} catch \(error\)/);
   assert.match(source, /"watch:unhandled-rejection"/);
   assert.match(source, /let definition = inputDefinition;\s*try \{\s*definition = await this\.ensureWatchIdentity/);
   assert.match(source, /"failure-escalation:failed"/);
   assert.match(source, /failureCount: failureEscalationFailed \? previous\.failureCount : failureCount/);
   assert.match(source, /"failure-state:persist-failed"/);
-  assert.match(source, /"failure-state:view-refresh-failed"/);
+  assert.doesNotMatch(source, /"failure-state:view-refresh-failed"/);
+  assert.match(source, /"path:view-refresh-failed"/);
+  assert.equal(viewSource.match(/await this\.render\(\);/g)?.length, 1);
   assert.match(source, /stateMigrated/);
 });
 

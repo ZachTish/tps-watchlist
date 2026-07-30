@@ -215,7 +215,18 @@ export default class TPSWatchlistPlugin extends Plugin {
     }
     const definition = this.definitionFromFile(file);
     if (!definition) throw new Error("The target note is not kind: watch.");
-    return await this.checkOne(definition, reason);
+    const result = await this.checkOne(definition, reason);
+    try {
+      await this.refreshViews();
+    } catch (error) {
+      logger.failure("Check", "path:view-refresh-failed", new Error(sanitizeWatchErrorMessage(error)), {
+        reason,
+        path: definition.path,
+        provider: definition.provider,
+        outcome: result.outcome,
+      });
+    }
+    return result;
   }
 
   async toggleWatchStatus(path: string): Promise<void> {
@@ -651,16 +662,6 @@ export default class TPSWatchlistPlugin extends Plugin {
       await this.persistStates();
     } catch (persistError) {
       logger.failure("Check", "failure-state:persist-failed", new Error(sanitizeWatchErrorMessage(persistError)), {
-        reason,
-        path: definition.path,
-        provider: definition.provider,
-        failureCount,
-      });
-    }
-    try {
-      await this.refreshViews();
-    } catch (refreshError) {
-      logger.failure("Check", "failure-state:view-refresh-failed", new Error(sanitizeWatchErrorMessage(refreshError)), {
         reason,
         path: definition.path,
         provider: definition.provider,
