@@ -1,5 +1,12 @@
 # TPS Watchlist
 
+## 0.2.4
+
+- Opening a new Watchlist dashboard now renders through Obsidian's public `View.onOpen` lifecycle once instead of immediately rebuilding the whole dashboard a second time.
+- Reopening an existing dashboard still performs one explicit refresh, so its latest watch state and current search text remain intact. Leaf creation, view state, reveal order, row order, errors, commands, settings, providers, integrations, and persisted data are unchanged.
+- Against exact public `0.2.3`, 300 first opens over 10,000 Markdown fixtures reduced dashboard renders from 600 to 300 and watch-definition parses from 6,000,000 to 3,000,000. Median time improved from 1.065 ms to 0.544 ms per ten-open sample and p95 from 1.111 ms to 0.713 ms.
+- This backward-compatible performance patch keeps the minimum supported Obsidian version at 1.10.0 and requires no migration. Validation covers 34 declared checks, exact-release lifecycle/error parity, a separate final build, and test-vault first-open/reopen QA; exact evidence and artifact hashes are in `release-notes/0.2.4.md`.
+
 ## 0.2.3
 
 - Watch batches now rebuild open dashboards once after all workers finish instead of once per failed watch plus once at batch completion.
@@ -35,6 +42,7 @@ Canonical source, tests, Git metadata, and dependencies live in `/Users/zachtish
 - 2026-07-24 settings-release validation: the 20 core tests and four routed-settings tests all passed. The required final standalone build deployed only to `[runtime-deploy] target=test`. Obsidian 1.12.7 was reloaded with `Reload app without saving`; all three settings destinations and the shared nine-plugin `Choose what to configure` pattern were inspected in the registered test vault without creating a watch, running a check, changing settings, or sending a notification. Runtime-owned state remained absent and production was not accessed or promoted.
 - 2026-07-28 efficiency validation: all 22 core tests and four routed-settings tests passed, including executable coverage of one-parse ordered discovery, snapshot isolation, bounded worker claiming, and completion-order results. The required standalone build deployed only to `[runtime-deploy] target=test`. After **Reload app without saving**, Obsidian 1.12.7 registered the Watchlist commands and rendered the empty dashboard. No watch was created, no check or outbound request ran, runtime-owned state remained absent, and production was not accessed or promoted.
 - 2026-07-30 persistence-release validation: all 26 core tests and four routed-settings tests passed, including exact coverage of active-plus-newest state coalescing, per-caller transient-failure progression, settings-write barriers, synchronized/unknown-field preservation, and serialized writes. The required standalone build deployed only to `[runtime-deploy] target=test` and a second post-QA build was byte-unchanged. After **Reload app without saving**, Obsidian 1.12.7 rendered all three settings destinations and the empty Watchlist dashboard. No setting changed, no watch was created, no check or outbound request ran, runtime-owned `data.json` remained absent, and production was not accessed or promoted.
+- 2026-07-30 first-open render validation: exact public `0.2.3` passed 32 declared checks and candidate `0.2.4` passed 34. An exact-source comparator preserved lifecycle, row-order, reveal, and failure behavior across first-open and existing-view paths while halving first-open dashboard renders and watch-definition parses. The required separate final build deployed only to `[runtime-deploy] target=test`. After **Reload app without saving**, Obsidian 1.12.7 rendered the empty dashboard on first open and refreshed the same single tab on reopen. No watch was created, no check or outbound request ran, runtime-owned `data.json` remained absent, and production was not accessed or promoted.
 - 2026-07-30 dashboard-refresh validation: the exact 0.2.2 path rebuilt views 101 times and parsed 101,000 Markdown fixtures for a 100-failure batch over a 1,000-file vault. Version 0.2.3 produced the same 100 failed results, failure counters, and 101 persistence requests while rebuilding once and parsing 1,000 files. Direct successful and failed checks each refreshed once, and a synthetic refresh rejection remained isolated. All 28 core tests and four routed-settings tests passed. Obsidian 1.12.7 reloaded the registered test vault and rendered the empty dashboard; **Check all**, **New watch**, and outbound integrations were not invoked. Runtime-owned `data.json` remained absent, and production was not accessed.
 
 ## Install with BRAT
@@ -301,6 +309,7 @@ Logs do not include source response bodies, full note bodies, complete settings 
 
 ## Version notes
 
+- 0.2.4: Removed the redundant full dashboard rebuild after a newly created view already rendered through `onOpen`; existing-view refresh behavior is unchanged.
 - 0.2.3: Coalesced failed-batch dashboard work into one final refresh and removed redundant action-level rerenders while preserving one isolated refresh for direct checks and status changes.
 - 0.2.2: Coalesced overlapping watch-state persistence to the active plus newest snapshots without crossing settings-write boundaries or losing per-caller failure progression.
 - 0.2.1: Replaced vault-wide watch-row intermediates with one ordered loop and changed batch work claiming from repeated front shifts to constant-time indexed access.

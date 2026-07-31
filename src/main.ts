@@ -266,6 +266,8 @@ export default class TPSWatchlistPlugin extends Plugin {
     if (!leaf) {
       leaf = this.app.workspace.getLeaf("tab");
       await leaf.setViewState({ type: WATCHLIST_VIEW_TYPE, active: true });
+      this.app.workspace.revealLeaf(leaf);
+      return;
     }
     this.app.workspace.revealLeaf(leaf);
     if (leaf.view instanceof WatchlistView) await leaf.view.render();

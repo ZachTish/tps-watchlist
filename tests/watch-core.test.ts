@@ -18,6 +18,7 @@ import {
 } from "../src/core";
 import TPSWatchlistPlugin from "../src/main";
 import { WatchlistPersistenceCoordinator } from "../src/persistence";
+import { WATCHLIST_VIEW_TYPE, WatchlistView } from "../src/view";
 import type { WatchDefinition, WatchObservation } from "../src/types";
 
 const definition = (overrides: Partial<WatchDefinition> = {}): WatchDefinition => ({
@@ -88,6 +89,120 @@ test("watch rows preserve file order and parse each Markdown file once", () => {
   assert.equal(rows[1].definition, second);
   assert.deepEqual(rows[1].state, createEmptyState());
   assert.equal(rows[1].active, false);
+});
+
+test("dashboard opens render once through the correct new or existing view lifecycle", async () => {
+  const files = Array.from({ length: 1_000 }, (_, index) => ({
+    path: `Notes/Dashboard ${index}.md`,
+  }));
+
+  const createHarness = (existing: boolean) => {
+    const plugin = Object.create(TPSWatchlistPlugin.prototype) as any;
+    let parsedFiles = 0;
+    let renders = 0;
+    let reveals = 0;
+    let viewStateCalls = 0;
+    plugin.states = {};
+    plugin.app = {
+      vault: { getMarkdownFiles: () => files },
+      workspace: {},
+    };
+    plugin.definitionFromFile = () => {
+      parsedFiles += 1;
+      return null;
+    };
+    const view = Object.create(WatchlistView.prototype) as any;
+    view.plugin = plugin;
+    view.render = async () => {
+      renders += 1;
+      plugin.getWatchRows();
+    };
+    const leaf: any = {
+      view: existing ? view : {},
+      async setViewState(state: { type: string; active: boolean }) {
+        viewStateCalls += 1;
+        assert.deepEqual(state, { type: WATCHLIST_VIEW_TYPE, active: true });
+        leaf.view = view;
+        await view.onOpen();
+      },
+    };
+    plugin.app.workspace.getLeavesOfType = (type: string) => {
+      assert.equal(type, WATCHLIST_VIEW_TYPE);
+      return existing ? [leaf] : [];
+    };
+    plugin.app.workspace.getLeaf = (kind: string) => {
+      assert.equal(kind, "tab");
+      return leaf;
+    };
+    plugin.app.workspace.revealLeaf = (revealedLeaf: unknown) => {
+      assert.equal(revealedLeaf, leaf);
+      reveals += 1;
+    };
+    return {
+      plugin,
+      counts: () => ({ parsedFiles, renders, reveals, viewStateCalls }),
+    };
+  };
+
+  const firstOpen = createHarness(false);
+  await firstOpen.plugin.openDashboard();
+  assert.deepEqual(firstOpen.counts(), {
+    parsedFiles: 1_000,
+    renders: 1,
+    reveals: 1,
+    viewStateCalls: 1,
+  });
+
+  const existingOpen = createHarness(true);
+  await existingOpen.plugin.openDashboard();
+  assert.deepEqual(existingOpen.counts(), {
+    parsedFiles: 1_000,
+    renders: 1,
+    reveals: 1,
+    viewStateCalls: 0,
+  });
+});
+
+test("dashboard opens preserve view lifecycle and existing-render failures", async () => {
+  const newLeafPlugin = Object.create(TPSWatchlistPlugin.prototype) as any;
+  let newLeafReveals = 0;
+  newLeafPlugin.app = {
+    workspace: {
+      getLeavesOfType: () => [],
+      getLeaf: () => ({
+        view: {},
+        setViewState: async () => {
+          throw new Error("synthetic setViewState failure");
+        },
+      }),
+      revealLeaf: () => {
+        newLeafReveals += 1;
+      },
+    },
+  };
+  await assert.rejects(() => newLeafPlugin.openDashboard(), /synthetic setViewState failure/);
+  assert.equal(newLeafReveals, 0);
+
+  const existingLeafPlugin = Object.create(TPSWatchlistPlugin.prototype) as any;
+  let existingLeafReveals = 0;
+  const view = Object.create(WatchlistView.prototype) as any;
+  view.render = async () => {
+    throw new Error("synthetic render failure");
+  };
+  const leaf = { view };
+  existingLeafPlugin.app = {
+    workspace: {
+      getLeavesOfType: () => [leaf],
+      getLeaf: () => {
+        throw new Error("existing dashboard must not allocate a leaf");
+      },
+      revealLeaf: () => {
+        existingLeafReveals += 1;
+      },
+    },
+  };
+  await assert.rejects(() => existingLeafPlugin.openDashboard(), /synthetic render failure/);
+  assert.equal(existingLeafReveals, 1);
 });
 
 test("concurrent watch checks consume one structural snapshot by index", async () => {
