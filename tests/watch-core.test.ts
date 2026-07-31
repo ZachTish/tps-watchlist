@@ -11,13 +11,13 @@ import {
   joinSingleFlight,
   observationFingerprint,
   parseNumericValue,
-  resolveJsonPath,
   sanitizeWatchErrorMessage,
   stableHash,
   WATCH_FINGERPRINT_VERSION,
 } from "../src/core";
 import TPSWatchlistPlugin from "../src/main";
 import { WatchlistPersistenceCoordinator } from "../src/persistence";
+import { resolveJsonPath } from "../src/providers";
 import { WATCHLIST_VIEW_TYPE, WatchlistView } from "../src/view";
 import type { WatchDefinition, WatchObservation } from "../src/types";
 
@@ -369,8 +369,35 @@ test("direct watch checks own one failure-isolated dashboard refresh", async () 
   assert.match(String(failureLogs[0]?.[0]), /path:view-refresh-failed/);
 });
 
-test("resolves nested JSON paths and bracket indexes", () => {
-  assert.equal(resolveJsonPath({ quote: { data: [{ price: 42.5 }] } }, "$.quote.data[0].price"), 42.5);
+test("live JSON provider resolver preserves supported paths and exact failures", () => {
+  const input = {
+    quote: {
+      data: [
+        { price: 42.5, details: { "display name": "Primary" } },
+      ],
+    },
+  };
+
+  assert.equal(resolveJsonPath(input, ""), input);
+  assert.equal(resolveJsonPath(input, "$"), input);
+  assert.equal(resolveJsonPath(input, "$.quote.data[0].price"), 42.5);
+  assert.equal(resolveJsonPath(input, "quote..data[0]['details'][\"display name\"]"), "Primary");
+  assert.equal(resolveJsonPath({ zero: 0, no: false, empty: "", nil: null }, "zero"), 0);
+  assert.equal(resolveJsonPath({ zero: 0, no: false, empty: "", nil: null }, "no"), false);
+  assert.equal(resolveJsonPath({ zero: 0, no: false, empty: "", nil: null }, "empty"), "");
+  assert.equal(resolveJsonPath({ zero: 0, no: false, empty: "", nil: null }, "nil"), null);
+  assert.throws(
+    () => resolveJsonPath(input, "$.quote.missing"),
+    { message: "JSON path key was not found: missing" },
+  );
+  assert.throws(
+    () => resolveJsonPath(input, "quote[data]"),
+    { message: "JSON path key was not found: quote[data]" },
+  );
+  assert.throws(
+    () => resolveJsonPath(input, "$.quote.data[0].price.value"),
+    { message: "JSON path stopped before value." },
+  );
 });
 
 test("extracts regex capture groups", () => {

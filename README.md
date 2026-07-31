@@ -1,5 +1,14 @@
 # TPS Watchlist
 
+## 0.2.5
+
+- JSON watches and their regression tests now share the same resolver in the live provider module; the unused duplicate resolver in the general core module has been removed.
+- Path tokenization now trims and skips raw split tokens in one traversal instead of allocating separate mapped and filtered arrays.
+- Root, dot, bracket-index, quoted-key, empty-segment, missing-key, non-object, output, and exact error behavior remain unchanged.
+- Exact public `0.2.4` and candidate provider modules matched across 500,060 supported JSON/path cases with zero value or error-message mismatches. In a 300,000-resolution nested-path benchmark, median time improved 7.24% and p95 improved 7.40%.
+- The combined runtime source is 22 lines smaller, the production bundle is 7 bytes smaller, and no cache, state, fallback, retry, monkeypatch, or unsupported API was added.
+- This backward-compatible performance/reliability patch keeps the minimum supported Obsidian version at 1.10.0 and requires no migration.
+
 ## 0.2.4
 
 - Opening a new Watchlist dashboard now renders through Obsidian's public `View.onOpen` lifecycle once instead of immediately rebuilding the whole dashboard a second time.
@@ -309,6 +318,7 @@ Logs do not include source response bodies, full note bodies, complete settings 
 
 ## Version notes
 
+- 0.2.5: Removed the duplicate test-only JSON-path resolver, made tests exercise the live provider implementation, and eliminated two token-array intermediates without changing supported path behavior.
 - 0.2.4: Removed the redundant full dashboard rebuild after a newly created view already rendered through `onOpen`; existing-view refresh behavior is unchanged.
 - 0.2.3: Coalesced failed-batch dashboard work into one final refresh and removed redundant action-level rerenders while preserving one isolated refresh for direct checks and status changes.
 - 0.2.2: Coalesced overlapping watch-state persistence to the active plus newest snapshots without crossing settings-write boundaries or losing per-caller failure progression.

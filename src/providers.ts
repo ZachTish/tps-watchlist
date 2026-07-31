@@ -59,7 +59,7 @@ function fromPage(definition: WatchDefinition, html: string): WatchObservation {
 }
 
 function fromJson(definition: WatchDefinition, json: unknown): WatchObservation {
-  const value = resolveJsonValue(json, definition.jsonPath);
+  const value = resolveJsonPath(json, definition.jsonPath);
   const serialized = typeof value === "string" ? value : stableSerialize(value);
   const extracted = extractPattern(serialized, definition.pattern, definition.caseSensitive);
   return observation(definition, extracted, definition.url, undefined, "JSON value");
@@ -105,16 +105,15 @@ function feedText(entry: Element): string {
   ].filter(Boolean).join(" "));
 }
 
-function resolveJsonValue(input: unknown, path: string): unknown {
+export function resolveJsonPath(input: unknown, path: string): unknown {
   const normalized = path.trim().replace(/^\$\.?/, "");
   if (!normalized) return input;
-  const tokens = normalized
-    .replace(/\[(?:'([^']+)'|"([^"]+)"|(\d+))\]/g, (_match, single, double, index) => "." + (single || double || index))
-    .split(".")
-    .map((token) => token.trim())
-    .filter(Boolean);
   let current = input;
-  for (const token of tokens) {
+  for (const rawToken of normalized
+    .replace(/\[(?:'([^']+)'|"([^"]+)"|(\d+))\]/g, (_match, single, double, index) => "." + (single || double || index))
+    .split(".")) {
+    const token = rawToken.trim();
+    if (!token) continue;
     if (current == null || typeof current !== "object") throw new Error("JSON path stopped before " + token + ".");
     const record = current as Record<string, unknown>;
     if (!(token in record)) throw new Error("JSON path key was not found: " + token);

@@ -89,27 +89,6 @@ export function parseNumericValue(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-export function resolveJsonPath(input: unknown, path: string): unknown {
-  const normalized = path.trim();
-  if (!normalized || normalized === "$") return input;
-  const tokens = normalized
-    .replace(/^\$\.?/, "")
-    .replace(/\[(?:'([^']+)'|"([^"]+)"|(\d+))\]/g, (_match, single, double, index) => "." + (single || double || index))
-    .split(".")
-    .map((token) => token.trim())
-    .filter(Boolean);
-  let current = input;
-  for (const token of tokens) {
-    if (current == null || (typeof current !== "object" && !Array.isArray(current))) {
-      throw new Error("JSON path stopped before " + token + ".");
-    }
-    const record = current as Record<string, unknown>;
-    if (!(token in record)) throw new Error("JSON path key was not found: " + token);
-    current = record[token];
-  }
-  return current;
-}
-
 export function extractPattern(value: string, pattern: string, caseSensitive: boolean): string {
   if (!pattern.trim()) return normalizeText(value);
   let regex: RegExp;
