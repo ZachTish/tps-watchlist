@@ -91,6 +91,45 @@ test("watch rows preserve file order and parse each Markdown file once", () => {
   assert.equal(rows[1].active, false);
 });
 
+test("scheduled checks preserve active, due, valid watch selection and order", async () => {
+  const dueFirst = definition({ id: "due-first", path: "Watches/Due first.md" });
+  const invalid = definition({ id: "invalid", path: "Watches/Invalid.md", url: "" });
+  const dueSecond = definition({ id: "due-second", path: "Watches/Due second.md" });
+  const rows = [
+    { definition: definition({ id: "inactive" }), state: createEmptyState(), active: false },
+    {
+      definition: definition({ id: "not-due" }),
+      state: { ...createEmptyState(), lastCheckedAt: "2999-01-01T00:00:00.000Z" },
+      active: true,
+    },
+    { definition: dueFirst, state: createEmptyState(), active: true },
+    { definition: invalid, state: createEmptyState(), active: true },
+    { definition: dueSecond, state: createEmptyState(), active: true },
+  ];
+  const plugin = Object.create(TPSWatchlistPlugin.prototype) as any;
+  plugin.settings = { executionMode: "this-device" };
+  plugin.getWatchRows = () => rows;
+  let selected: WatchDefinition[] | undefined;
+  let selectedReason = "";
+  let selectedDueOnly = false;
+  plugin.checkDefinitions = async (
+    definitions: WatchDefinition[],
+    reason: string,
+    dueOnly: boolean,
+  ) => {
+    selected = definitions;
+    selectedReason = reason;
+    selectedDueOnly = dueOnly;
+    return [];
+  };
+
+  await plugin.runScheduledChecks("regression");
+
+  assert.deepEqual(selected, [dueFirst, dueSecond]);
+  assert.equal(selectedReason, "scheduler:regression");
+  assert.equal(selectedDueOnly, true);
+});
+
 test("dashboard opens render once through the correct new or existing view lifecycle", async () => {
   const files = Array.from({ length: 1_000 }, (_, index) => ({
     path: `Notes/Dashboard ${index}.md`,

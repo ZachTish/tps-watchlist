@@ -391,17 +391,24 @@ export default class TPSWatchlistPlugin extends Plugin {
       });
       return;
     }
-    const rows = this.getWatchRows().filter((row) => row.active && isDue(row.definition, row.state));
-    const invalid = rows.filter((row) => validateDefinition(row.definition).length > 0);
-    if (invalid.length) {
+    const due: WatchDefinition[] = [];
+    const invalidPaths: string[] = [];
+    let invalidCount = 0;
+    for (const row of this.getWatchRows()) {
+      if (!row.active || !isDue(row.definition, row.state)) continue;
+      if (validateDefinition(row.definition).length > 0) {
+        invalidCount += 1;
+        if (invalidPaths.length < 5) invalidPaths.push(row.definition.path);
+      } else {
+        due.push(row.definition);
+      }
+    }
+    if (invalidCount > 0) {
       logger.warn("Scheduler", "drafts:skipped", {
-        count: invalid.length,
-        paths: invalid.slice(0, 5).map((row) => row.definition.path),
+        count: invalidCount,
+        paths: invalidPaths,
       });
     }
-    const due = rows
-      .filter((row) => validateDefinition(row.definition).length === 0)
-      .map((row) => row.definition);
     if (!due.length) return;
     await this.checkDefinitions(due, "scheduler:" + reason, true);
   }

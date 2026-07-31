@@ -1,6 +1,6 @@
 {
   "name": "tps-watchlist",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Contract-native external monitoring for TPS.",
   "main": "main.js",
   "scripts": {

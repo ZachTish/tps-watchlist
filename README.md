@@ -1,5 +1,14 @@
 # TPS Watchlist
 
+## 0.2.6
+
+- Scheduled watch selection now combines active/due filtering, draft classification, warning-path collection, and valid-definition collection in one ordered traversal.
+- Every due definition is validated once instead of twice; draft-warning count and first-five path order, valid-watch order, batch arguments, scheduler guards, providers, state, and user-facing behavior remain unchanged.
+- Exact public `0.2.5` and candidate runtime methods matched across 1,000 seeded scenarios containing 151,599 active, inactive, due, not-due, valid, and invalid rows with zero selected-output or warning-payload mismatches.
+- A 20,000-watch due fixture reduces validation calls from 40,000 to 20,000. Across 51 interleaved actual-method rounds, median selection time fell 82.44% and p95 fell 74.42%; the production bundle is 46 bytes smaller.
+- No cache, state, fallback, retry, monkeypatch, timer, listener, persisted field, unsupported API, setting, command, or migration was added.
+- This backward-compatible performance/reliability patch keeps the minimum supported Obsidian version at 1.10.0.
+
 ## 0.2.5
 
 - JSON watches and their regression tests now share the same resolver in the live provider module; the unused duplicate resolver in the general core module has been removed.
