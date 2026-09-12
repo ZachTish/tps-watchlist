@@ -79,8 +79,6 @@ export class WatchlistSettingTab extends PluginSettingTab {
       button.dataset.watchSettingsPage = destination.id;
       button.setAttr("aria-pressed", String(this.activeSettingsPage === destination.id));
       button.createSpan({ cls: "tps-watch-settings-route-title", text: destination.label });
-      button.createSpan({ cls: "tps-watch-settings-route-summary", text: destination.summary });
-      button.createSpan({ cls: "tps-watch-settings-route-description", text: destination.description });
       button.addEventListener("click", () => {
         if (this.activeSettingsPage === destination.id) return;
         this.navigateToPage(destination.id);
@@ -99,10 +97,6 @@ export class WatchlistSettingTab extends PluginSettingTab {
     });
     const heading = section.createEl("h3", { text: destination.label });
     heading.setAttr("tabindex", "-1");
-    section.createEl("p", {
-      cls: "setting-item-description tps-watch-settings-page-description",
-      text: destination.description,
-    });
     return section;
   }
 
@@ -110,16 +104,9 @@ export class WatchlistSettingTab extends PluginSettingTab {
     const root = this.containerEl;
     root.empty();
     root.createEl("h2", { text: "TPS Watchlist" });
-    root.createEl("p", {
-      text: "Watch notes remain canonical Markdown. Plugin state stores only baselines, fingerprints, check health, and delivery deduplication.",
-    });
 
     this.renderShortcuts(root);
     root.createEl("h3", { text: "Choose what to configure", cls: "tps-watch-settings-hub-heading" });
-    root.createEl("p", {
-      text: "Pick one destination. Watch rules stay in each watch, while these pages control shared defaults and reliability.",
-      cls: "setting-item-description tps-watch-settings-hub-description",
-    });
     this.renderDestinationHub(root);
     const page = this.createPage(root, this.activeSettingsPage);
 
